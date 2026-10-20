@@ -462,12 +462,51 @@ test("parseToolCallResponse recovers a complete JSON payload without a closing t
   );
 });
 
+test("parseToolCallResponse runs a complete payload whose closing tag is missing or garbled", () => {
+  // Seen on OpenCode v2.1.1 free models: no closer plus an invented result,
+  // a mangled closer, or a stray opening tag. The text after the payload is
+  // dropped, never shown.
+  const responses = [
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}} trailing prose',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\\n\\nThe command printed /tmp.',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\n</rfl:parameter>pi_tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}<pi_tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\\n</pi_tool_call>',
+  ];
+
+  for (const response of responses) {
+    const result = parseToolCallResponse(response, new Set(["bash"]));
+    assert.equal(result.ok, true, response);
+    if (!result.ok) continue;
+    assert.deepEqual(result.calls, [{ name: "bash", arguments: { command: "pwd" } }], response);
+  }
+});
+
+test("streamOpenCode runs an unclosed marker and never shows the invented result", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "text",
+        part: {
+          text: '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\\n\\nThe command printed /tmp.',
+        },
+      },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+  );
+
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(
+    message.content.map((block) => block.type),
+    ["toolCall"],
+  );
+});
+
 test("parseToolCallResponse degrades unrecoverable markers to stripped plain text", () => {
   const responses = [
     '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}',
-    '<pi_tool_call>{"name":"bash","arguments":{}} trailing prose',
-    '<pi_tool_call>{"name":"bash","arguments":{}}</tool_call>',
-    '<pi_tool_call>{"name":"bash","arguments":{}}<pi_tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"} trailing prose',
   ];
 
   for (const response of responses) {

@@ -1180,10 +1180,11 @@ function findMarkerClose(text: string, from: number): MarkerClose | undefined {
   return undefined;
 }
 
-// Some models emit a complete marker payload but omit only the closing tag.
-// Recover that narrow case by locating one complete top-level JSON object or
-// array and requiring whitespace-only content afterward. Payload validation
-// and the current-turn tool allowlist are still applied by the caller.
+// Some models emit a complete marker payload but omit or garble the closing
+// tag, and often follow it with an invented tool result. Recover the payload
+// by locating one complete top-level JSON object or array; the caller strips
+// whatever follows it. Truncated JSON is never recovered, and payload
+// validation and the current-turn tool allowlist are still applied.
 function recoverUnclosedMarkerBody(
   text: string,
   bodyStart: number,
@@ -1216,10 +1217,7 @@ function recoverUnclosedMarkerBody(
 
     const expected = char === "}" ? "{" : "[";
     if (stack.pop() !== expected) return undefined;
-    if (stack.length === 0) {
-      const end = i + 1;
-      return text.slice(end).trim() ? undefined : text.slice(bodyStart, end);
-    }
+    if (stack.length === 0) return text.slice(bodyStart, i + 1);
   }
   return undefined;
 }
@@ -1241,8 +1239,7 @@ function normalizeQuotedToolCallResponse(text: string): string {
  * Extract <pi_tool_call> marker bodies from the response text.
  * Lenient: markers are extracted anywhere in the text, even with prose
  * before or after them, matching how real models behave. A marker whose
- * payload cannot be recovered (truncated JSON, unclosed with trailing
- * content) is recorded as an invalid span instead of aborting extraction,
+ * payload cannot be recovered (truncated JSON) is recorded as an invalid span instead of aborting extraction,
  * so valid sibling markers still parse and the unrecoverable text can be
  * stripped from the displayed response (#39).
  */
@@ -1278,7 +1275,10 @@ function toolCallMarkers(text: string): MarkerExtraction | undefined {
 
     const recovered = recoverUnclosedMarkerBody(trimmed, bodyStart);
     if (recovered !== undefined) {
-      const end = bodyStart + recovered.length;
+      // Without a closing tag, everything up to the next opening marker
+      // belongs to this attempt (a garbled closer or an invented result).
+      const nextOpen = trimmed.indexOf(MARKER_OPEN, bodyStart + recovered.length);
+      const end = nextOpen === -1 ? trimmed.length : nextOpen;
       markers.push({ body: recovered, start: openIndex, end });
       cursor = end;
       continue;
@@ -1395,7 +1395,16 @@ export function parseToolCallResponse(
     | undefined;
 
   for (const marker of extraction.markers) {
-    const calls = parseToolCallJson(marker.body);
+    let calls = parseToolCallJson(marker.body);
+    if (calls.length === 0) {
+      // A closed marker can still carry junk after a complete payload, such
+      // as a literal "\n" before the closing tag; drop it like an unclosed
+      // marker's trailing text.
+      const payload = recoverUnclosedMarkerBody(marker.body, 0);
+      if (payload !== undefined && payload.trim() !== marker.body.trim()) {
+        calls = parseToolCallJson(payload);
+      }
+    }
     if (calls.length === 0) {
       // Skip the invalid body but keep any valid sibling calls; if no
       // call survives, surface the original corrective diagnostic.
