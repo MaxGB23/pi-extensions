@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **claude-code-pi docs**: The terms-of-service review is now checked against Anthropic's terms as of October 20, 2026. It corrects the claim that `claude -p` usage on a subscription draws from a separate Agent SDK credit pool: Anthropic paused that change on June 15, 2026, so this usage still counts against normal plan limits. It also adds the Usage Policy rule against proxying Claude through consumer subscriptions (2026 update, effective November 12, 2026), the Claude Code rules on credentials and intermediation, and the monthly API credits added to Max and Team plans on October 7, 2026. The note about `--permission-mode dontAsk` now says that Pi, not Claude Code, executes tool calls under Pi's own permission settings.
 - **opencode-pi 1.5.0**: The OpenCode CLI invocation moved into a dedicated helper that bounds every attempt with its own timeout and detaches its abort listener, so a turn can be retried once when OpenCode reports that it cannot resolve the bridge agent.
 
 ## [0.3.0] — 2026-09-28
