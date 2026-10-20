@@ -10,7 +10,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import test from "node:test";
+import test, { mock } from "node:test";
 import type {
   Api,
   AssistantMessageEvent,
@@ -657,7 +657,10 @@ require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", functi
   ).finally(() => rmSync(dir, { recursive: true, force: true }));
 });
 
-test("the shared server stops after 10 idle minutes unless a turn starts first", async (t) => {
+// Mock timers landed in Node 20.4; the package still supports Node 18.
+const mockTimersSkip = !("timers" in mock) && "needs Node >=20.4 mock timers";
+
+test("the shared server stops after 10 idle minutes unless a turn starts first", { skip: mockTimersSkip }, async (t) => {
   const IDLE_SHUTDOWN_MS = 10 * 60_000;
   await withFakeOpenCode(
     `if (process.argv[2] !== "serve") process.exit(1);
