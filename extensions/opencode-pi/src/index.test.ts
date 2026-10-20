@@ -2580,6 +2580,43 @@ test("opencode-pi panel hides configured model IDs, supports cancellation, and p
   }
 });
 
+test("opencode-pi subcommands send all their lines as one notification", async () => {
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_BIN = join(tmpdir(), "opencode-pi-missing-bin");
+  process.env.OPENCODE_PI_MODELS = "opencode/model-a,opencode/model-b";
+
+  try {
+    const captured = panelOpenCodeCommand();
+    await opencodePiExtension(captured.extension);
+    const expected: Record<string, RegExp[]> = {
+      status: [/^Provider: /, /opencode\/model-a/, /opencode\/model-b/],
+      models: [/opencode\/model-a/, /opencode\/model-b/, /Override with OPENCODE_PI_MODELS/],
+      test: [/^Run: pi -p /, /OpenCode check: /],
+      help: [/^Usage: \/opencode-pi/, /OPENCODE_PI_STREAM=0/],
+      update: [/^opencode-pi: refreshed 2 model\(s\)\. .*Discovery issue: /, /Registered models: 2/],
+    };
+    for (const [sub, patterns] of Object.entries(expected)) {
+      const notifications: RecordedNotification[] = [];
+      await captured.command.handler(sub, {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          notify(message: string, level?: string) {
+            notifications.push({ message, level });
+          },
+        },
+      });
+      assert.equal(notifications.length, 1, sub);
+      assert.equal(notifications[0].level, "info", sub);
+      for (const pattern of patterns) assert.match(notifications[0].message, new RegExp(pattern, "m"), sub);
+    }
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
 test("opencode-pi keeps informational rows in detail and supports Back, another section, Close, and Escape", async () => {
   const previousModels = process.env.OPENCODE_PI_MODELS;
   process.env.OPENCODE_PI_MODELS = "custom-panel-model";

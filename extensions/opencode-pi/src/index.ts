@@ -776,10 +776,7 @@ export async function discoverModels(opts?: {
   };
 }
 
-async function refreshModels(
-  pi: ExtensionAPI,
-  ctx: { ui: { notify: (msg: string, level?: string) => void } },
-): Promise<void> {
+async function refreshModels(pi: ExtensionAPI): Promise<string> {
   const previousModels = new Set(registeredModels.map((model) => model.id));
   const { models, time, error } = await discoverModels({
     forceDiscovery: true,
@@ -798,7 +795,7 @@ async function refreshModels(
       .join(", ")}${newModels.length > 5 ? ", ..." : ""}`;
   }
   if (error) msg += ` Discovery issue: ${error}`;
-  ctx.ui.notify(msg, "info");
+  return msg;
 }
 
 function emptyUsage(): AssistantMessage["usage"] {
@@ -2897,50 +2894,45 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
       }
 
       const sub = trimmedArgs.split(/\s+/).filter(Boolean)[0] ?? "status";
+      // Pi's TUI replaces one info notification with the next, so each
+      // subcommand sends its lines as a single multi-line notification.
       if (sub === "status") {
-        for (const line of statusLines()) ctx.ui.notify(line, "info");
+        ctx.ui.notify(statusLines().join("\n"), "info");
         return;
       }
       if (sub === "models") {
-        for (const model of registeredModels)
-          ctx.ui.notify(`${PROVIDER_ID}/${model.id}`, "info");
         ctx.ui.notify(
-          `Override with OPENCODE_PI_MODELS="opencode/model-a,opencode/model-b"`,
+          [
+            ...registeredModels.map((model) => `${PROVIDER_ID}/${model.id}`),
+            `Override with OPENCODE_PI_MODELS="opencode/model-a,opencode/model-b"`,
+          ].join("\n"),
           "info",
         );
         return;
       }
       if (sub === "test") {
         ctx.ui.notify(
-          `Run: pi -p --provider ${PROVIDER_ID} --model ${registeredModels[0]?.id ?? DEFAULT_FREE_MODELS[0]} "Reply with exactly OK"`,
-          "info",
-        );
-        ctx.ui.notify(
-          `OpenCode check: ${opencodeBin()} run -m ${registeredModels[0]?.id ?? DEFAULT_FREE_MODELS[0]} --format json "Reply OK"`,
+          [
+            `Run: pi -p --provider ${PROVIDER_ID} --model ${registeredModels[0]?.id ?? DEFAULT_FREE_MODELS[0]} "Reply with exactly OK"`,
+            `OpenCode check: ${opencodeBin()} run -m ${registeredModels[0]?.id ?? DEFAULT_FREE_MODELS[0]} --format json "Reply OK"`,
+          ].join("\n"),
           "info",
         );
         return;
       }
       if (sub === "update") {
-        await refreshModels(pi, ctx);
-        for (const line of statusLines()) ctx.ui.notify(line, "info");
+        const refreshed = await refreshModels(pi);
+        ctx.ui.notify([refreshed, ...statusLines()].join("\n"), "info");
         return;
       }
       if (sub === "help") {
         ctx.ui.notify(
-          "Usage: /opencode-pi [status|models|test|update|help]",
-          "info",
-        );
-        ctx.ui.notify(
-          "Set OPENCODE_PI_BIN to override the opencode executable.",
-          "info",
-        );
-        ctx.ui.notify(
-          "Set OPENCODE_PI_MODELS to register a custom comma-separated model list.",
-          "info",
-        );
-        ctx.ui.notify(
-          "Set OPENCODE_PI_STREAM=0 to run OpenCode v1 turns through opencode run instead of streaming them.",
+          [
+            "Usage: /opencode-pi [status|models|test|update|help]",
+            "Set OPENCODE_PI_BIN to override the opencode executable.",
+            "Set OPENCODE_PI_MODELS to register a custom comma-separated model list.",
+            "Set OPENCODE_PI_STREAM=0 to run OpenCode v1 turns through opencode run instead of streaming them.",
+          ].join("\n"),
           "info",
         );
         return;
