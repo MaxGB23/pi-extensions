@@ -46,7 +46,14 @@ import opencodePiExtension, {
   streamOpenCode,
   showOpenCodePanelList,
   trackedPiSessionCount,
+  whenStartupChecked,
 } from "./index.js";
+
+// These tests drive the `opencode run` transport; stream.test.ts covers the
+// streaming `opencode serve` transport.
+process.env.OPENCODE_PI_STREAM = "0";
+// Keep the model cache out of the real Pi agent directory.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "opencode-pi-agent-"));
 
 function fakeModel(): Model<Api> {
   return {
@@ -455,12 +462,51 @@ test("parseToolCallResponse recovers a complete JSON payload without a closing t
   );
 });
 
+test("parseToolCallResponse runs a complete payload whose closing tag is missing or garbled", () => {
+  // Seen on OpenCode v2.1.1 free models: no closer plus an invented result,
+  // a mangled closer, or a stray opening tag. The text after the payload is
+  // dropped, never shown.
+  const responses = [
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}} trailing prose',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\\n\\nThe command printed /tmp.',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\n</rfl:parameter>pi_tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}</tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}<pi_tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\\n</pi_tool_call>',
+  ];
+
+  for (const response of responses) {
+    const result = parseToolCallResponse(response, new Set(["bash"]));
+    assert.equal(result.ok, true, response);
+    if (!result.ok) continue;
+    assert.deepEqual(result.calls, [{ name: "bash", arguments: { command: "pwd" } }], response);
+  }
+});
+
+test("streamOpenCode runs an unclosed marker and never shows the invented result", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      {
+        type: "text",
+        part: {
+          text: '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}\\n\\nThe command printed /tmp.',
+        },
+      },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+  );
+
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(
+    message.content.map((block) => block.type),
+    ["toolCall"],
+  );
+});
+
 test("parseToolCallResponse degrades unrecoverable markers to stripped plain text", () => {
   const responses = [
     '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}',
-    '<pi_tool_call>{"name":"bash","arguments":{}} trailing prose',
-    '<pi_tool_call>{"name":"bash","arguments":{}}</tool_call>',
-    '<pi_tool_call>{"name":"bash","arguments":{}}<pi_tool_call>',
+    '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"} trailing prose',
   ];
 
   for (const response of responses) {
@@ -750,6 +796,25 @@ test("streamOpenCode continues when OpenCode refused its own tool before it ran"
     message.content.some((block) => block.type === "text"),
     true,
   );
+});
+
+test("streamOpenCode continues after OpenCode v2.1.1 refusals", async () => {
+  const refusals: unknown[] = [
+    "Permission denied: external_directory",
+    { type: "permission.rejected", message: "Permission denied: external_directory" },
+    'No tool named "bash" is currently available. Use one of the available tools instead.',
+  ];
+  for (const error of refusals) {
+    const message = await withFakeOpenCode(
+      fakeEventScript([
+        { type: "tool_use", part: { tool: "read", state: { status: "error", error } } },
+        { type: "text", part: { text: "used the Pi read tool instead" } },
+      ]),
+      () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+    );
+    assert.equal(message.stopReason, "stop", JSON.stringify(error));
+    assert.equal(message.errorMessage, undefined, JSON.stringify(error));
+  }
 });
 
 test("streamOpenCode fails when OpenCode completed a locally executed native tool", async () => {
@@ -1317,6 +1382,7 @@ function sessionStartRecorder() {
     async run(ctx: NotifyCtx) {
       if (!handler) throw new Error("session_start handler not registered");
       await handler({}, ctx);
+      await whenStartupChecked();
     },
   };
 }
@@ -1381,6 +1447,41 @@ test("session_start flags the OPENCODE_PI_MODELS fast path when the binary is mi
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!.message, /OPENCODE_PI_MODELS skipped discovery/);
     assert.match(warnings[0]!.message, /could not use the local OpenCode CLI/);
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
+test("session_start skips startup notices once the session has shut down", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "custom-model-a";
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  process.env.OPENCODE_PI_BIN = join(tmpdir(), "opencode-pi-does-not-exist");
+  const handlers = new Map<string, (event: unknown, ctx?: unknown) => unknown>();
+
+  try {
+    await opencodePiExtension({
+      registerProvider() {},
+      on(event: string, handler: (event: unknown, ctx?: unknown) => unknown) {
+        handlers.set(event, handler);
+      },
+      registerCommand() {},
+    } as unknown as ExtensionAPI);
+
+    // Pi invalidates the ctx after session_shutdown; any use then throws.
+    let usedAfterShutdown = false;
+    const staleCtx = {
+      get ui() {
+        usedAfterShutdown = true;
+        throw new Error("ctx is stale");
+      },
+    };
+    handlers.get("session_start")!({}, staleCtx);
+    handlers.get("session_shutdown")!({});
+    await whenStartupChecked();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(usedAfterShutdown, false);
   } finally {
     restoreEnv("OPENCODE_PI_BIN", previousBin);
     restoreEnv("OPENCODE_PI_MODELS", previousModels);
@@ -2087,6 +2188,52 @@ test("streamOpenCode reuses the session and sends only the transcript delta", as
   }
 });
 
+// Real OpenCode v2.1.1 `run --format json` events; v2.1.1 sometimes exits
+// without the step_finish event, so `finish` toggles it.
+function v2UsageFakeScript(capturePath: string, finish: boolean): string {
+  const sid = "ses_ea5cd2e65ffe12nAkoYiqvThnj";
+  const events = [
+    { type: "step_start", sessionID: sid, part: { sessionID: sid, type: "step-start" } },
+    { type: "text", sessionID: sid, part: { sessionID: sid, type: "text", text: "ut-teal-7731" } },
+    ...(finish ? [{ type: "step_finish", sessionID: sid, part: { sessionID: sid, type: "step-finish", reason: "stop", cost: 0, tokens: { input: 271, output: 10, reasoning: 9, cache: { read: 7168, write: 0 } } } }] : []),
+  ];
+  return `if (process.argv.includes("session")) process.exit(0);
+require("node:fs").appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), stdin: "" }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(events.map((event) => JSON.stringify(event)).join("\n") + "\n")}));
+`;
+}
+
+test("streamOpenCode reports v2 continuation cache usage, or estimates the full context", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "invocations.jsonl");
+  const piSessionId = `pi-v2-usage-${Date.now()}`;
+  const turn = (texts: string[], finish: boolean) =>
+    withFakeOpenCode(v2UsageFakeScript(capturePath, finish), () =>
+      streamOpenCode(fakeModel(), conversation(texts), { sessionId: piSessionId }).result(), "opencode v2.1.1");
+  const conversation = (texts: string[]) => ({
+    messages: texts.map((text, index) => index % 2
+      ? { role: "assistant", content: [{ type: "text", text }], timestamp: index + 1 }
+      : { role: "user", content: text, timestamp: index + 1 }),
+  }) as unknown as Context;
+  const first = `remember ${"context ".repeat(2000)}`;
+  try {
+    const fresh = await turn([first], false);
+    const reported = await turn([first, "ut-teal-7731", "colour?"], true);
+    assert.deepEqual(
+      [reported.usage.input, reported.usage.output, reported.usage.cacheRead, reported.usage.cacheWrite],
+      [271, 19, 7168, 0],
+    );
+    const estimated = await turn([first, "ut-teal-7731", "colour?", "ut-teal-7731", "again?"], false);
+    assert.equal(readInvocations(capturePath).filter((call) => call.args.includes("--session")).length, 2);
+    // Without step_finish the estimate covers the whole conversation, not the delta.
+    assert.ok(estimated.usage.input >= fresh.usage.input, `${estimated.usage.input} < ${fresh.usage.input}`);
+  } finally {
+    await cleanupPiSessionState(piSessionId);
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
 test("streamOpenCode starts fresh after an error drops the session", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
@@ -2537,6 +2684,43 @@ test("opencode-pi panel hides configured model IDs, supports cancellation, and p
   }
 });
 
+test("opencode-pi subcommands send all their lines as one notification", async () => {
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_BIN = join(tmpdir(), "opencode-pi-missing-bin");
+  process.env.OPENCODE_PI_MODELS = "opencode/model-a,opencode/model-b";
+
+  try {
+    const captured = panelOpenCodeCommand();
+    await opencodePiExtension(captured.extension);
+    const expected: Record<string, RegExp[]> = {
+      status: [/^Provider: /, /opencode\/model-a/, /opencode\/model-b/],
+      models: [/opencode\/model-a/, /opencode\/model-b/, /Override with OPENCODE_PI_MODELS/],
+      test: [/^Run: pi -p /, /OpenCode check: /],
+      help: [/^Usage: \/opencode-pi/, /OPENCODE_PI_STREAM=0/],
+      update: [/^opencode-pi: refreshed 2 model\(s\)\. .*Discovery issue: /, /Registered models: 2/],
+    };
+    for (const [sub, patterns] of Object.entries(expected)) {
+      const notifications: RecordedNotification[] = [];
+      await captured.command.handler(sub, {
+        mode: "tui",
+        hasUI: true,
+        ui: {
+          notify(message: string, level?: string) {
+            notifications.push({ message, level });
+          },
+        },
+      });
+      assert.equal(notifications.length, 1, sub);
+      assert.equal(notifications[0].level, "info", sub);
+      for (const pattern of patterns) assert.match(notifications[0].message, new RegExp(pattern, "m"), sub);
+    }
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
 test("opencode-pi keeps informational rows in detail and supports Back, another section, Close, and Escape", async () => {
   const previousModels = process.env.OPENCODE_PI_MODELS;
   process.env.OPENCODE_PI_MODELS = "custom-panel-model";
@@ -2570,7 +2754,7 @@ test("opencode-pi keeps informational rows in detail and supports Back, another 
       "OpenCode CLI status (cached) (1/3)",
       "OpenCode CLI status (cached) (1/3)",
       "opencode-pi (read-only)",
-      "opencode-pi configuration (1/2)",
+      "opencode-pi configuration (1/3)",
     ]);
     assert.ok(selections[1]!.options.includes("Back"));
     assert.ok(selections[1]!.options.includes("Close"));
