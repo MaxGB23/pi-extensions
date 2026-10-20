@@ -2848,12 +2848,19 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
 
   // Tear down per-Pi-session OpenCode state — project directories and
   // session records — when the Pi session ends for any reason (#74).
+  // Pi invalidates a session's ctx right after session_shutdown, so a
+  // background check that settles later must not notify on it.
+  let sessionGeneration = 0;
   pi.on("session_shutdown", () => {
+    sessionGeneration++;
     void cleanupPiSessionState();
   });
 
   pi.on("session_start", (_event: any, ctx: any) => {
-    void startupCheck.then((cliStatus) => notifyStartup(ctx, cliStatus));
+    const generation = ++sessionGeneration;
+    void startupCheck.then((cliStatus) => {
+      if (generation === sessionGeneration) notifyStartup(ctx, cliStatus);
+    });
   });
 
   function notifyStartup(ctx: any, cliStatus: CliStatus): void {

@@ -1395,6 +1395,41 @@ test("session_start flags the OPENCODE_PI_MODELS fast path when the binary is mi
   }
 });
 
+test("session_start skips startup notices once the session has shut down", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "custom-model-a";
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  process.env.OPENCODE_PI_BIN = join(tmpdir(), "opencode-pi-does-not-exist");
+  const handlers = new Map<string, (event: unknown, ctx?: unknown) => unknown>();
+
+  try {
+    await opencodePiExtension({
+      registerProvider() {},
+      on(event: string, handler: (event: unknown, ctx?: unknown) => unknown) {
+        handlers.set(event, handler);
+      },
+      registerCommand() {},
+    } as unknown as ExtensionAPI);
+
+    // Pi invalidates the ctx after session_shutdown; any use then throws.
+    let usedAfterShutdown = false;
+    const staleCtx = {
+      get ui() {
+        usedAfterShutdown = true;
+        throw new Error("ctx is stale");
+      },
+    };
+    handlers.get("session_start")!({}, staleCtx);
+    handlers.get("session_shutdown")!({});
+    await whenStartupChecked();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(usedAfterShutdown, false);
+  } finally {
+    restoreEnv("OPENCODE_PI_BIN", previousBin);
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
 test("session_start produces no warning when opencode answers --version", async () => {
   const previousModels = process.env.OPENCODE_PI_MODELS;
   delete process.env.OPENCODE_PI_MODELS;
