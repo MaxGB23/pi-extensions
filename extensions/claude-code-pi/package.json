@@ -1,6 +1,6 @@
 {
   "name": "claude-code-pi",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Bridge Claude Code CLI models into Pi strictly through claude -p",
   "type": "module",
   "main": "./dist/index.js",
@@ -45,8 +45,8 @@
   },
   "homepage": "https://github.com/luongnv89/pi-extensions/tree/main/extensions/claude-code-pi",
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.75.4",
-    "@earendil-works/pi-ai": "^0.75.4"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
   },
   "devDependencies": {
     "typescript": "^5.6.0"
