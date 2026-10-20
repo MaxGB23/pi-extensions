@@ -7,13 +7,21 @@ const OUTPUT_LIMIT = 20_000;
 
 // Runs `opencode serve` and stops it when its stdin closes, which happens
 // whenever Pi exits, even on SIGKILL. Without it a killed Pi would leave the
-// server running.
+// server running. OpenCode can ignore SIGTERM for several seconds (while it
+// installs a project's dependencies), so the watchdog stays until the server
+// exits and sends SIGKILL after a grace period.
 const WATCHDOG = `const { spawn } = require("node:child_process");
 const [bin, ...args] = JSON.parse(process.env.OPENCODE_PI_SERVE_ARGV);
 // OpenCode is a compiled Bun binary; BUN_BE_BUN would turn it into plain bun.
 delete process.env.BUN_BE_BUN;
 const child = spawn(bin, args, { stdio: ["ignore", "inherit", "inherit"] });
-const stop = () => { child.kill("SIGTERM"); setTimeout(() => process.exit(0), 2000).unref(); };
+let stopping = false;
+const stop = () => {
+  if (stopping) return;
+  stopping = true;
+  child.kill("SIGTERM");
+  setTimeout(() => child.kill("SIGKILL"), 3000);
+};
 process.stdin.on("end", stop);
 process.stdin.on("error", stop);
 process.stdin.resume();

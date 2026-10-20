@@ -631,3 +631,28 @@ require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", functi
     },
   );
 });
+
+test("the watchdog kills a server that ignores SIGTERM", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-pid-"));
+  const pidFile = join(dir, "serve.pid");
+  await withFakeOpenCode(
+    `if (process.argv[2] !== "serve") process.exit(1);
+process.on("SIGTERM", () => undefined);
+require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", function () {
+  console.log("opencode server listening on http://127.0.0.1:" + this.address().port);
+});`,
+    async () => {
+      const server = await withOpenCodeServer(process.env.OPENCODE_PI_BIN!, process.env, async (server) => server);
+      const pid = Number(readFileSync(pidFile, "utf8"));
+      stopOpenCodeServer();
+      const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+      const deadline = Date.now() + 10_000;
+      while ((alive() || server.child.exitCode === null && server.child.signalCode === null) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.equal(alive(), false, "opencode serve survived the watchdog");
+      assert.notEqual(server.child.exitCode ?? server.child.signalCode, null, "the watchdog is still running");
+    },
+  ).finally(() => rmSync(dir, { recursive: true, force: true }));
+});
