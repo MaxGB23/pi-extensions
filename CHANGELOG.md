@@ -7,7 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **opencode-pi**: OpenCode v1 replies now stream into Pi as the model writes them. `opencode run --format json` only prints a text or reasoning part once it is finished, so a long reply used to appear in one piece at the end of the turn. On OpenCode v1 the bridge now starts one `opencode serve` per Pi process (localhost only, random port and password, stopped by a watchdog when Pi exits and after 10 idle minutes) and forwards its text and reasoning deltas. Text that might start a `<pi_tool_call>` marker is held back until the marker is parsed, so raw markers never reach Pi; prose before a tool call now stays visible. If the server cannot start, turns fall back to `opencode run`, and `OPENCODE_PI_STREAM=0` turns streaming off. OpenCode v2 turns are unchanged and do not stream. Based on work by @0xCUB3 in #138.
+
+### Changed
+
+- **opencode-pi**: Loading the extension no longer blocks Pi's startup on `opencode` discovery. It registers the models from the last discovery (cached in Pi's agent directory) right away and refreshes them in the background; only the first start, with no cache yet, waits. Discovery reads `opencode --version` first and skips the v2 API call on v1, which used to answer with its whole help screen, and discovery errors are trimmed to one line.
+
 ### Fixed
+
+- **opencode-pi**: OpenCode v1 can call the free models again. The v1 agent denied every tool, and OpenCode's free-tier gateway rejects a request that declares none ("OpenCode's free tier can only be used from within OpenCode"). Like the v2 agent, it now keeps one inert `read` rule that asks for approval, and the ask is always rejected, so the read never executes.
+- **opencode-pi**: OpenCode v1 no longer spends a second request on the same model to title each new session; on the free tier that request shared the rate limit with the turn. The bridge instructions also say that OpenCode's `<env>` block describes the bridge's scratch directory, not the directory Pi runs tools in.
 
 - **opencode-pi 1.5.0**: The bridge works again on Pi 1.x and on OpenCode v2. On Pi 1.x the provider API hands extensions a normalized transcript instead of the old context object, so `context.systemPrompt` and `context.tools` came through empty: the model was told no Pi tools were available and the system prompt was dropped, and the leading transcript system message crashed the turn with `message.content.map is not a function`. The extension now reads the system prompt, the tool declarations and the tool allowlist from the transcript when it carries a system message and falls back to the legacy context otherwise, renders system messages as prompt scaffolding instead of transcript entries, and normalizes message content so a `null`, string or single-object payload can never crash a turn.
 - **opencode-pi 1.5.0**: The OpenCode v2 turn no longer fails with `Agent not found: "pi-model"`. The v2 CLI resolves its working directory from `PWD`, and spawning with a working directory alone does not update it, so the CLI loaded the project config from the parent directory and never registered the bridge agent. The child process now receives `PWD` set to the project directory, and a turn that still reports the missing agent is retried once with a fresh process.

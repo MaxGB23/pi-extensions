@@ -1,9 +1,10 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { basename, dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   calculateCost,
   createAssistantMessageEventStream,
@@ -21,6 +22,14 @@ import {
   type Tool,
   type ToolCall,
 } from "@earendil-works/pi-ai";
+import {
+  runningOpenCodeServer,
+  serverRequest,
+  subscribeEvents,
+  withOpenCodeServer,
+  type OpenCodeServer,
+  type ServerEvent,
+} from "./server.js";
 
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
@@ -182,6 +191,7 @@ async function showOpenCodePanel(ctx: any): Promise<void> {
       const detail = await showOpenCodePanelList(ctx, "opencode-pi configuration (environment presence)", [
         `OPENCODE_PI_BIN: ${panelEnvState("OPENCODE_PI_BIN")}`,
         `OPENCODE_PI_MODELS: ${panelEnvState("OPENCODE_PI_MODELS")}`,
+        `OPENCODE_PI_STREAM: ${panelEnvState("OPENCODE_PI_STREAM")}`,
       ]);
       if (detail === "close") return;
       continue;
@@ -207,19 +217,56 @@ async function cliDialect(forceVersion = false): Promise<CliDialect> {
   const bin = opencodeBin();
   if (!forceVersion && detectedCli?.bin === bin) return detectedCli.dialect;
   const result = await runCapture(["--version"], undefined, STATUS_TIMEOUT_MS);
-  const version = (result.stdout.trim() || result.stderr.trim()).match(
-    /^(?:opencode\s+)?v?(\d+)\.\d+\.\d+(?:[-+][\w.-]+)?$/i,
-  );
-  if (result.code !== 0 || !version || Number(version[1]) < 1) {
+  const dialect = result.code === 0 ? dialectOf(result.stdout.trim() || result.stderr.trim()) : undefined;
+  if (!dialect) {
     throw new Error("Cannot determine OpenCode CLI version for run arguments");
   }
-  const dialect: CliDialect = Number(version[1]) >= 2 ? "v2" : "v1";
   detectedCli = { bin, dialect };
   return dialect;
 }
 
+function dialectOf(version: string): CliDialect | undefined {
+  const major = Number(version.match(/^(?:opencode\s+)?v?(\d+)\.\d+\.\d+(?:[-+][\w.-]+)?$/i)?.[1]);
+  if (!(major >= 1)) return undefined;
+  return major >= 2 ? "v2" : "v1";
+}
+
+/** CLI failures can print a whole help screen; keep one short line. */
+function conciseError(text: string): string {
+  const line = text.replace(/\x1b\[[0-9;]*m/g, "").replace(/\s+/g, " ").trim();
+  return line.length > 200 ? `${line.slice(0, 197)}...` : line;
+}
+
+// Discovered models are cached so startup can register them without
+// waiting on the CLI.
+function modelCachePath(): string {
+  return join(getAgentDir(), "cache", "opencode-pi-models.json");
+}
+
+async function readModelCache(): Promise<OpenCodeModelInfo[] | undefined> {
+  try {
+    const cache = JSON.parse(await readFile(modelCachePath(), "utf8"));
+    return cache?.bin === opencodeBin() && Array.isArray(cache.models) && cache.models.length > 0
+      ? cache.models
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function writeModelCache(models: OpenCodeModelInfo[]): Promise<void> {
+  const path = modelCachePath();
+  await mkdir(dirname(path), { recursive: true });
+  await writeFile(path, JSON.stringify({ bin: opencodeBin(), models }), "utf8");
+}
+
 function opencodeBin(): string {
   return process.env.OPENCODE_PI_BIN?.trim() || "opencode";
+}
+
+/** OpenCode v1 turns stream through `opencode serve` unless OPENCODE_PI_STREAM is off. */
+function streamingEnabled(): boolean {
+  return !/^(0|off|false|no)$/i.test(process.env.OPENCODE_PI_STREAM?.trim() ?? "");
 }
 
 function configuredModels(): string[] | undefined {
@@ -648,6 +695,8 @@ export async function checkCliStatus(): Promise<CliStatus> {
     }
     const version =
       result.stdout.trim() || result.stderr.trim() || "OpenCode CLI is available";
+    const dialect = dialectOf(version);
+    if (dialect) detectedCli = { bin: opencodeBin(), dialect };
     return { ok: true, summary: version };
   } catch (error) {
     return {
@@ -684,7 +733,11 @@ export async function discoverModels(opts?: {
   }
 
   const errors: string[] = [];
+  // The version picks the metadata call this CLI has; an unknown version
+  // tries them all.
+  const dialect = await cliDialect(opts?.forceDiscovery).catch(() => undefined);
   for (const attempt of DISCOVERY_ATTEMPTS) {
+    if (dialect && attempt.dialect && attempt.dialect !== dialect) continue;
     try {
       const metadata = await attempt.run();
       if (metadata.length === 0) {
@@ -700,13 +753,15 @@ export async function discoverModels(opts?: {
         throw new Error("discovery returned no free models");
       }
 
-      const dialect = attempt.dialect ?? (await cliDialect(true));
-      detectedCli = { bin: opencodeBin(), dialect };
+      if (!dialect && attempt.dialect) {
+        detectedCli = { bin: opencodeBin(), dialect: attempt.dialect };
+      }
       lastDiscoveryError = undefined;
+      if (!configured?.length) await writeModelCache(selected).catch(() => undefined);
       return { models: selected, time: Date.now(), error: undefined };
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      errors.push(`${attempt.label}: ${detail}`);
+      errors.push(`${attempt.label}: ${conciseError(detail)}`);
     }
   }
 
@@ -731,23 +786,7 @@ async function refreshModels(
   });
   registeredModels = models;
   lastDiscoveryTime = time;
-
-  // Re-register the provider with the updated model list
-  const providerConfig: Parameters<ExtensionAPI["registerProvider"]>[1] = {
-    name: "OpenCode CLI",
-    baseUrl: "cli:opencode",
-    apiKey: "opencode-cli-no-api-key",
-    api: API_ID,
-    models: models.map(providerModel),
-    streamSimple: streamOpenCode,
-  };
-
-  try {
-    pi.registerProvider(PROVIDER_ID, providerConfig);
-  } catch {
-    // registerProvider may reject if already registered; the models array is already updated.
-  }
-  registerApiHandler();
+  registerModels(pi);
 
   const newModels = models.filter((model) => !previousModels.has(model.id));
 
@@ -1051,6 +1090,7 @@ function buildPrompt(context: Context): string {
 
 You are being used as the model backend for Pi Coding Agent through the OpenCode CLI.
 OpenCode's own tools are disabled. Do not try to use OpenCode tools.
+OpenCode's <env> block describes the bridge's scratch directory. Pi runs your tools in the working directory from Pi's system prompt.
 
 If you need Pi to run a tool, your entire response must contain only one or more tool-call blocks separated by whitespace:
 <pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>
@@ -1269,6 +1309,76 @@ function stripMarkerSpans(text: string, spans: MarkerSpan[]): string {
   }
   cleaned += text.slice(cursor);
   return cleaned;
+}
+
+/** Streams reply text without ever releasing a Pi tool-call marker. */
+export type MarkerStreamFilter = {
+  /** Everything pushed so far. */
+  readonly text: string;
+  /** Add a delta; returns the text that is now safe to show. */
+  push(delta: string): string;
+  /**
+   * End the reply; returns the held text that is still safe to show.
+   * `displayText` is the parsed reply's display text, released whole when
+   * the reply was held as a JSON-quoted string.
+   */
+  finish(displayText: string): string;
+};
+
+/**
+ * Text is released as soon as it cannot start a `<pi_tool_call>` marker. A
+ * marker is held until its closing tag arrives and is then skipped, and an
+ * unclosed marker holds everything after it until the reply ends, so raw
+ * markers never stream into Pi. A reply that opens with a quote may be a
+ * JSON-quoted marker response, so it is held whole.
+ */
+export function createMarkerStreamFilter(): MarkerStreamFilter {
+  let text = "";
+  let released = 0;
+  let quoted: boolean | undefined;
+
+  const drain = (): string => {
+    if (quoted === undefined) {
+      const start = text.trimStart();
+      if (!start) return "";
+      quoted = start.startsWith('"');
+    }
+    if (quoted) return "";
+    let out = "";
+    while (true) {
+      const open = text.indexOf(MARKER_OPEN, released);
+      if (open === -1) {
+        // Hold a trailing prefix of the opening marker.
+        let held = Math.min(MARKER_OPEN.length - 1, text.length - released);
+        while (held > 0 && !MARKER_OPEN.startsWith(text.slice(text.length - held))) {
+          held -= 1;
+        }
+        out += text.slice(released, text.length - held);
+        released = text.length - held;
+        return out;
+      }
+      out += text.slice(released, open);
+      released = open;
+      const close = findMarkerClose(text, open + MARKER_OPEN.length);
+      if (!close) return out;
+      released = close.index + close.length;
+    }
+  };
+
+  return {
+    get text() {
+      return text;
+    },
+    push(delta: string): string {
+      text += delta;
+      return drain();
+    },
+    finish(displayText: string): string {
+      if (quoted) return displayText;
+      const rest = text.slice(released);
+      return rest.startsWith(MARKER_OPEN) ? "" : rest;
+    },
+  };
 }
 
 export function parseToolCallResponse(
@@ -1609,7 +1719,7 @@ export async function cleanupPiSessionState(
         const dirPromise = state.dirPromise;
         state.dirPromise = undefined;
         const dir = await dirPromise.catch(() => undefined);
-        if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+        if (dir) await removeSessionDir(dir);
       }
     }),
   );
@@ -1685,13 +1795,18 @@ const AGENT_BODY = `You are the OpenCode side of a Pi Coding Agent bridge. OpenC
 /**
  * Agent definition for OpenCode v1, which uses the legacy `permission` map
  * and the v1 action names (`bash`, `task`).
+ *
+ * `read` asks instead of denying for the same reason as in {@link AGENT_V2}:
+ * the free-tier gateway refuses a request that declares no tools. Both
+ * `opencode run` and the streaming server path reject the ask, so the read
+ * never executes.
  */
 const AGENT_V1 = `---
 description: Pi bridge agent. OpenCode tools are denied; Pi tool calls are emitted as text markers.
 mode: primary
 permission:
   "*": deny
-  read: deny
+  read: ask
   edit: deny
   glob: deny
   grep: deny
@@ -1755,7 +1870,28 @@ async function createTempAgentDir(dialect: CliDialect): Promise<string> {
     agentDefinition(dialect),
     "utf8",
   );
+  if (dialect === "v1") {
+    // OpenCode would spend a second request on the same model to title each
+    // session. On the free tier that request shares, and hits, the rate limit.
+    await writeFile(join(agentsDir, "title.md"), "---\ndisable: true\n---\n", "utf8");
+  }
   return dir;
+}
+
+/** Unload a project directory from the shared server, then delete it. */
+async function removeSessionDir(dir: string): Promise<void> {
+  const server = runningOpenCodeServer();
+  if (server) {
+    await serverRequest(
+      server,
+      "POST",
+      "/instance/dispose",
+      dir,
+      undefined,
+      AbortSignal.timeout(SESSION_DELETE_TIMEOUT_MS),
+    ).catch(() => undefined);
+  }
+  await rm(dir, { recursive: true, force: true }).catch(() => undefined);
 }
 
 /** Everything one `opencode run` invocation produced. */
@@ -1934,6 +2070,209 @@ export async function runOpenCodeTurn(params: {
   return { code, state };
 }
 
+/** Receives a server turn's text and reasoning deltas as they arrive. */
+export type OpenCodeStreamSink = {
+  text(partId: string, delta: string): void;
+  thinking(partId: string, delta: string): void;
+};
+
+/**
+ * Run one turn on the shared `opencode serve` (OpenCode v1) and pass text and
+ * reasoning deltas to `sink` while the model writes them. `opencode run` only
+ * prints a part once it is finished.
+ *
+ * The result has the same shape as {@link runOpenCodeTurn}: `code` is 0 once
+ * the session goes idle and null when the turn was aborted or timed out.
+ */
+export async function runOpenCodeServerTurn(params: {
+  server: OpenCodeServer;
+  directory: string;
+  /** Recorded session to continue; a new session is created otherwise. */
+  sessionId?: string;
+  body: unknown;
+  signal?: AbortSignal;
+  timeoutMs: number;
+  model: Model<Api>;
+  output: AssistantMessage;
+  sink: OpenCodeStreamSink;
+  onSessionId?: (sessionId: string) => void;
+}): Promise<{ code: number | null; state: OpenCodeTurnState }> {
+  const { server, directory, body, signal, timeoutMs, model, output, sink } = params;
+  const state: OpenCodeTurnState = {
+    text: "",
+    thinking: "",
+    stderr: "",
+    finishReason: "stop",
+    timedOut: false,
+  };
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => {
+    state.timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const request = (method: string, path: string, payload?: unknown) =>
+    serverRequest(server, method, path, directory, payload, controller.signal);
+
+  const partKinds = new Map<string, "text" | "thinking">();
+  const partText = new Map<string, string>();
+  const userMessages = new Set<string>();
+  const append = (partId: string, delta: string) => {
+    const kind = partKinds.get(partId);
+    if (!kind || !delta) return;
+    partText.set(partId, (partText.get(partId) ?? "") + delta);
+    if (kind === "text") {
+      state.text += delta;
+      sink.text(partId, delta);
+    } else {
+      state.thinking += delta;
+      sink.thinking(partId, delta);
+    }
+  };
+
+  /** Handle one server event; returns true once the session is idle. */
+  const handleEvent = async (event: ServerEvent): Promise<boolean> => {
+    const props = event.properties ?? {};
+
+    if (event.type === "message.updated") {
+      const info = props.info;
+      if (info?.sessionID === state.sessionId && info?.role === "user") {
+        userMessages.add(info.id);
+      }
+      return false;
+    }
+
+    if (event.type === "message.part.delta") {
+      if (props.sessionID === state.sessionId && props.field === "text" && typeof props.delta === "string") {
+        append(props.partID, props.delta);
+      }
+      return false;
+    }
+
+    if (event.type === "message.part.updated") {
+      const part = props.part;
+      if (!part || part.sessionID !== state.sessionId || userMessages.has(part.messageID)) {
+        return false;
+      }
+      // Only the model's own parts carry `time`; the prompt's text part
+      // does not.
+      if ((part.type === "text" || part.type === "reasoning") && part.time && !part.synthetic) {
+        partKinds.set(part.id, part.type === "text" ? "text" : "thinking");
+        // Older servers send the whole text so far instead of deltas, and a
+        // finished part carries its full text: emit what is still missing.
+        const seen = partText.get(part.id) ?? "";
+        if (typeof part.text === "string" && part.text.startsWith(seen)) {
+          append(part.id, part.text.slice(seen.length));
+        }
+        return false;
+      }
+      if (part.type === "step-finish") {
+        if (/length|max.?tokens/i.test(String(part.reason ?? ""))) {
+          state.finishReason = "length";
+        }
+        const tokens = part.tokens;
+        if (!tokens) return false;
+        output.usage.input = Number(tokens.input ?? 0);
+        output.usage.output = Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
+        output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
+        output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
+        output.usage.totalTokens = Number(
+          tokens.total ??
+            output.usage.input +
+              output.usage.output +
+              output.usage.cacheRead +
+              output.usage.cacheWrite,
+        );
+        calculateCost(model, output.usage);
+        return false;
+      }
+      if (part.type === "tool" && (part.state?.status === "completed" || part.state?.status === "error")) {
+        // Same rule as `opencode run`: a refused OpenCode tool changed
+        // nothing, a tool that executed fails the turn.
+        const refused =
+          part.state.status === "error" &&
+          OPENCODE_PERMISSION_REJECTION.test(String(part.state.error ?? ""));
+        if (!refused) state.toolUse = part.tool ? String(part.tool) : "unknown";
+      }
+      return false;
+    }
+
+    if (event.type === "permission.asked" && props.sessionID === state.sessionId) {
+      // `opencode run` auto-rejects asks, so the server does too. Rejecting
+      // one ask rejects every pending ask in the session, so a parallel
+      // call's ask can already be gone (404) by its turn.
+      await request("POST", `/permission/${props.id}/reply`, { reply: "reject" }).catch(
+        (error: unknown) => {
+          if (!/ failed with 404:/.test(String(error))) throw error;
+        },
+      );
+      return false;
+    }
+
+    if (event.type === "session.error" && props.sessionID === state.sessionId) {
+      const message = props.error?.data?.message ?? props.error?.message ?? props.error?.name;
+      state.error =
+        typeof message === "string" && message.trim() ? message.trim() : safeJson(props.error);
+      state.stderr = (state.stderr + `\n${state.error}`).slice(-STDERR_LIMIT);
+      return false;
+    }
+
+    return (
+      props.sessionID === state.sessionId &&
+      ((event.type === "session.status" && props.status?.type === "idle") ||
+        event.type === "session.idle")
+    );
+  };
+
+  let finished = false;
+  try {
+    // Subscribe first so no event published for the prompt is missed.
+    const events = await subscribeEvents(server, directory, controller.signal);
+    try {
+      const sessionId = params.sessionId ?? (await request("POST", "/session", {}))?.id;
+      if (typeof sessionId !== "string" || !sessionId) {
+        throw new Error("OpenCode did not return a session ID");
+      }
+      state.sessionId = sessionId;
+      params.onSessionId?.(sessionId);
+      await request("POST", `/session/${sessionId}/prompt_async`, body);
+      for await (const event of events) {
+        if (await handleEvent(event)) {
+          finished = true;
+          break;
+        }
+      }
+    } finally {
+      await events.return(undefined).catch(() => undefined);
+    }
+    if (!finished) throw new Error("OpenCode event stream ended before the turn finished");
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    if (state.sessionId) {
+      await serverRequest(
+        server,
+        "POST",
+        `/session/${state.sessionId}/abort`,
+        directory,
+        undefined,
+        AbortSignal.timeout(SESSION_DELETE_TIMEOUT_MS),
+      ).catch(() => undefined);
+    }
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    clearTimeout(timer);
+  }
+
+  return { code: finished ? 0 : null, state };
+}
+
+// Set once `opencode serve` failed to start for a binary, so later turns go
+// straight to `opencode run` instead of waiting on the server again.
+let serverUnavailableFor: string | undefined;
+
 export function streamOpenCode(
   model: Model<Api>,
   context: Context,
@@ -1966,6 +2305,48 @@ export function streamOpenCode(
         : undefined;
     const piState = piSessionId ? getPiSessionState(piSessionId) : undefined;
     const transcriptParts = serializedTranscriptParts(context.messages);
+
+    // Server turns stream as they arrive. Each OpenCode text or reasoning
+    // part becomes one Pi content block, closed when the next one starts,
+    // and text passes the marker filter first.
+    let streamed = false;
+    const filter = createMarkerStreamFilter();
+    let open: { partId: string; index: number } | undefined;
+    let visibleText = "";
+    const closeOpen = () => {
+      if (!open) return;
+      const contentIndex = open.index;
+      const block = output.content[contentIndex];
+      open = undefined;
+      if (block?.type === "text") {
+        stream.push({ type: "text_end", contentIndex, content: block.text, partial: output });
+      } else if (block?.type === "thinking") {
+        stream.push({ type: "thinking_end", contentIndex, content: block.thinking, partial: output });
+      }
+    };
+    const appendBlock = (partId: string, kind: "text" | "thinking", delta: string) => {
+      if (!delta) return;
+      if (open?.partId !== partId || output.content[open.index]?.type !== kind) {
+        closeOpen();
+        open = { partId, index: output.content.length };
+        output.content.push(kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" });
+        stream.push({ type: kind === "text" ? "text_start" : "thinking_start", contentIndex: open.index, partial: output });
+      }
+      const contentIndex = open.index;
+      const block = output.content[contentIndex];
+      if (block?.type === "text") {
+        block.text += delta;
+        visibleText += delta;
+        stream.push({ type: "text_delta", contentIndex, delta, partial: output });
+      } else if (block?.type === "thinking") {
+        block.thinking += delta;
+        stream.push({ type: "thinking_delta", contentIndex, delta, partial: output });
+      }
+    };
+    const sink: OpenCodeStreamSink = {
+      text: (partId, delta) => appendBlock(partId, "text", filter.push(delta)),
+      thinking: (partId, delta) => appendBlock(partId, "thinking", delta),
+    };
 
     try {
       stream.push({ type: "start", partial: output });
@@ -2052,7 +2433,65 @@ export function streamOpenCode(
       // The timeout is unconditional: a turn is always bounded, even when
       // Pi supplies no timeoutMs (#73).
       const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
-      let turn = await runOpenCodeTurn({
+      const bin = opencodeBin();
+      let turn: { code: number | null; state: OpenCodeTurnState } | undefined;
+      if (dialect === "v1" && streamingEnabled() && serverUnavailableFor !== bin) {
+        // OpenCode v2's server speaks a different API, so only v1 streams.
+        const serverVariant = requestedReasoning && requestedReasoning !== "off"
+          ? model.thinkingLevelMap?.[requestedReasoning]
+          : undefined;
+        const slash = model.id.indexOf("/");
+        const body = {
+          agent: AGENT_ID,
+          model: slash > 0
+            ? { providerID: model.id.slice(0, slash), modelID: model.id.slice(slash + 1) }
+            : { providerID: "opencode", modelID: model.id },
+          ...(typeof serverVariant === "string" && serverVariant.trim()
+            ? { variant: serverVariant }
+            : {}),
+          // The same file parts `opencode run --file` sends.
+          parts: [
+            ...imagePaths.map((path, index) => ({
+              type: "file",
+              mime: images[index]!.mimeType,
+              filename: basename(path),
+              url: pathToFileURL(path).href,
+            })),
+            { type: "text", text: prompt },
+          ],
+        };
+        let serverStarted = false;
+        try {
+          turn = await withOpenCodeServer(
+            bin,
+            { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
+            (server) => {
+              serverStarted = true;
+              streamed = true;
+              return runOpenCodeServerTurn({
+                server,
+                directory: sessionDir,
+                sessionId: isContinuation ? piState?.opencodeSessionId : undefined,
+                body,
+                signal: options?.signal,
+                timeoutMs: turnTimeoutMs,
+                model,
+                output,
+                sink,
+                onSessionId: (id) => {
+                  capturedSessionId = id;
+                },
+              });
+            },
+          );
+        } catch (error) {
+          if (serverStarted || options?.signal?.aborted) throw error;
+          // `opencode serve` did not start, so this CLI runs every turn
+          // through `opencode run` instead.
+          serverUnavailableFor = bin;
+        }
+      }
+      turn ??= await runOpenCodeTurn({
         args,
         prompt,
         cwd: dialect === "v2" ? sessionDir : undefined,
@@ -2065,6 +2504,7 @@ export function streamOpenCode(
       // loaded the project agent file, which fails the turn with "Agent not
       // found". A fresh process gets another chance at the same turn.
       if (
+        !streamed &&
         turn.code !== 0 &&
         !turn.state.timedOut &&
         !options?.signal?.aborted &&
@@ -2081,7 +2521,7 @@ export function streamOpenCode(
         });
       }
       const { code, state } = turn;
-      capturedSessionId = state.sessionId;
+      capturedSessionId = state.sessionId ?? capturedSessionId;
 
       if (options?.signal?.aborted) {
         throw new Error("Request was aborted");
@@ -2121,7 +2561,17 @@ export function streamOpenCode(
       const toolCalls = toolCallResult.calls;
       // Unrecoverable marker text is stripped so it never leaks into the
       // visible chat response; remaining prose still displays normally.
-      const displayText = toolCallResult.cleanedText ?? accumulatedText;
+      let displayText = toolCallResult.cleanedText ?? accumulatedText;
+      if (streamed) {
+        // Release the text the filter still holds, then the streamed text
+        // is what Pi shows.
+        appendBlock(
+          open?.partId ?? "final",
+          "text",
+          filter.finish(toolCalls.length > 0 ? "" : displayText),
+        );
+        displayText = visibleText;
+      }
       if (toolCalls.length === 0 && displayText.trim()) {
         // Check if the model tried to use XML-style tool-use instead of
         // <pi_tool_call> markers — a common mistake with Claude-based models.
@@ -2175,7 +2625,9 @@ export function streamOpenCode(
         deleteOpenCodeSession(capturedSessionId);
       }
 
-      if (accumulatedThinking) {
+      // Streamed text and thinking are already in the message.
+      if (streamed) closeOpen();
+      else if (accumulatedThinking) {
         const thinkingIndex = output.content.length;
         output.content.push({ type: "thinking", thinking: accumulatedThinking });
         stream.push({
@@ -2232,7 +2684,7 @@ export function streamOpenCode(
       }
 
       output.stopReason = finishReason;
-      if (displayText) {
+      if (displayText && !streamed) {
         const contentIndex = output.content.length;
         output.content.push({ type: "text", text: displayText });
         stream.push({ type: "text_start", contentIndex, partial: output });
@@ -2252,6 +2704,7 @@ export function streamOpenCode(
       stream.push({ type: "done", reason: finishReason, message: output });
       stream.end();
     } catch (error) {
+      closeOpen();
       // Any error, timeout, or abort drops the session ID so the next turn
       // starts fresh with the full transcript; the failed session record is
       // deleted best-effort and never fails the turn (#71, #75).
@@ -2270,11 +2723,7 @@ export function streamOpenCode(
     } finally {
       // Only one-shot turns own their directory. Per-Pi-session directories
       // persist for reuse and are removed at session teardown (#74).
-      if (tempDir) {
-        await rm(tempDir, { recursive: true, force: true }).catch(
-          () => undefined,
-        );
-      }
+      if (tempDir) await removeSessionDir(tempDir);
     }
   })();
 
@@ -2326,6 +2775,11 @@ function statusLines(): string[] {
     "OpenCode tools are disabled; Pi tool use is bridged with prompt-level tool-call markers.",
   );
   lines.push(
+    streamingEnabled()
+      ? "Streaming: OpenCode v1 replies stream through opencode serve; v2 replies arrive when each part finishes."
+      : "Streaming: off (OPENCODE_PI_STREAM); replies arrive when each part finishes.",
+  );
+  lines.push(
     "Run /opencode-pi update to refresh the model list from opencode.",
   );
   return lines;
@@ -2343,20 +2797,54 @@ function registerApiHandler(): void {
   );
 }
 
-export default async function opencodePiExtension(pi: ExtensionAPI) {
-  const { models, time } = await discoverModels();
-  registeredModels = models;
-  lastDiscoveryTime = time;
-
-  pi.registerProvider(PROVIDER_ID, {
-    name: "OpenCode CLI",
-    baseUrl: "cli:opencode",
-    apiKey: "opencode-cli-no-api-key",
-    api: API_ID,
-    models: registeredModels.map(providerModel),
-    streamSimple: streamOpenCode,
-  });
+function registerModels(pi: ExtensionAPI): void {
+  try {
+    pi.registerProvider(PROVIDER_ID, {
+      name: "OpenCode CLI",
+      baseUrl: "cli:opencode",
+      apiKey: "opencode-cli-no-api-key",
+      api: API_ID,
+      models: registeredModels.map(providerModel),
+      streamSimple: streamOpenCode,
+    });
+  } catch {
+    // registerProvider may reject if already registered; the models array is already updated.
+  }
   registerApiHandler();
+}
+
+let startupCheck: Promise<CliStatus> = Promise.resolve({ ok: true, summary: "" });
+
+/** Settles once the background CLI check and model discovery finish. */
+export function whenStartupChecked(): Promise<CliStatus> {
+  return startupCheck;
+}
+
+async function checkCliAndDiscover(pi: ExtensionAPI): Promise<CliStatus> {
+  const status = await checkCliStatus();
+  lastCliAvailable = status.ok;
+  if (!status.ok) return status;
+  const { models, time } = await discoverModels();
+  lastDiscoveryTime = time;
+  if (JSON.stringify(models) !== JSON.stringify(registeredModels)) {
+    registeredModels = models;
+    registerModels(pi);
+  }
+  return status;
+}
+
+export default async function opencodePiExtension(pi: ExtensionAPI) {
+  // Register the last discovered models (or the defaults) right away and
+  // ask the CLI in the background, so loading Pi never waits on OpenCode.
+  const known = configuredModels()?.length
+    ? (await discoverModels()).models
+    : await readModelCache();
+  registeredModels = known ?? DEFAULT_FREE_MODELS.map(fallbackModel);
+  registerModels(pi);
+  startupCheck = checkCliAndDiscover(pi);
+  // The first start has no cache, and Pi may ask for a model only
+  // discovery knows, so that one start waits.
+  if (!known) await startupCheck;
 
   // Tear down per-Pi-session OpenCode state — project directories and
   // session records — when the Pi session ends for any reason (#74).
@@ -2364,9 +2852,11 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
     void cleanupPiSessionState();
   });
 
-  pi.on("session_start", async (_event: any, ctx: any) => {
-    const cliStatus = await checkCliStatus();
-    lastCliAvailable = cliStatus.ok;
+  pi.on("session_start", (_event: any, ctx: any) => {
+    void startupCheck.then((cliStatus) => notifyStartup(ctx, cliStatus));
+  });
+
+  function notifyStartup(ctx: any, cliStatus: CliStatus): void {
     if (!cliStatus.ok) {
       const fastPathConfigured = Boolean(configuredModels()?.length);
       const fastPathNote = fastPathConfigured
@@ -2388,7 +2878,7 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
         "warning",
       );
     }
-  });
+  }
 
   pi.registerCommand("opencode-pi", {
     description: "OpenCode CLI bridge status and setup help",
@@ -2440,6 +2930,10 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
         );
         ctx.ui.notify(
           "Set OPENCODE_PI_MODELS to register a custom comma-separated model list.",
+          "info",
+        );
+        ctx.ui.notify(
+          "Set OPENCODE_PI_STREAM=0 to run OpenCode v1 turns through opencode run instead of streaming them.",
           "info",
         );
         return;

@@ -46,7 +46,14 @@ import opencodePiExtension, {
   streamOpenCode,
   showOpenCodePanelList,
   trackedPiSessionCount,
+  whenStartupChecked,
 } from "./index.js";
+
+// These tests drive the `opencode run` transport; stream.test.ts covers the
+// streaming `opencode serve` transport.
+process.env.OPENCODE_PI_STREAM = "0";
+// Keep the model cache out of the real Pi agent directory.
+process.env.PI_CODING_AGENT_DIR = mkdtempSync(join(tmpdir(), "opencode-pi-agent-"));
 
 function fakeModel(): Model<Api> {
   return {
@@ -1317,6 +1324,7 @@ function sessionStartRecorder() {
     async run(ctx: NotifyCtx) {
       if (!handler) throw new Error("session_start handler not registered");
       await handler({}, ctx);
+      await whenStartupChecked();
     },
   };
 }
@@ -2570,7 +2578,7 @@ test("opencode-pi keeps informational rows in detail and supports Back, another 
       "OpenCode CLI status (cached) (1/3)",
       "OpenCode CLI status (cached) (1/3)",
       "opencode-pi (read-only)",
-      "opencode-pi configuration (1/2)",
+      "opencode-pi configuration (1/3)",
     ]);
     assert.ok(selections[1]!.options.includes("Back"));
     assert.ok(selections[1]!.options.includes("Close"));
