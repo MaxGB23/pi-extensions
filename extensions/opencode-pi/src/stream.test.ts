@@ -656,3 +656,42 @@ require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", functi
     },
   ).finally(() => rmSync(dir, { recursive: true, force: true }));
 });
+
+test("the shared server stops after 10 idle minutes unless a turn starts first", async (t) => {
+  const IDLE_SHUTDOWN_MS = 10 * 60_000;
+  await withFakeOpenCode(
+    `if (process.argv[2] !== "serve") process.exit(1);
+require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", function () {
+  console.log("opencode server listening on http://127.0.0.1:" + this.address().port);
+});`,
+    async () => {
+      const bin = process.env.OPENCODE_PI_BIN!;
+      // Mock timers only once the server is up, so its real start timeout is unaffected.
+      const server = await withOpenCodeServer(bin, process.env, async (server) => {
+        t.mock.timers.enable({ apis: ["setTimeout"] });
+        return server;
+      });
+      t.mock.timers.tick(IDLE_SHUTDOWN_MS - 1);
+      assert.equal(runningOpenCodeServer(), server, "stopped before the idle window ended");
+
+      // A turn inside the window cancels the pending stop, however long it runs.
+      await withOpenCodeServer(bin, process.env, async (reused) => {
+        assert.equal(reused, server);
+        t.mock.timers.tick(IDLE_SHUTDOWN_MS);
+        assert.equal(runningOpenCodeServer(), server, "stopped during a turn");
+      });
+
+      // The window restarts from the end of the last turn.
+      t.mock.timers.tick(IDLE_SHUTDOWN_MS - 1);
+      assert.equal(runningOpenCodeServer(), server, "the idle window did not restart");
+      t.mock.timers.tick(1);
+      assert.equal(runningOpenCodeServer(), undefined, "still running after the idle window");
+      assert.equal(server.child.killed, true, "the server was not signalled to stop");
+
+      t.mock.timers.reset();
+      if (server.child.exitCode === null && server.child.signalCode === null) {
+        await new Promise((resolve) => server.child.once("exit", resolve));
+      }
+    },
+  );
+});
