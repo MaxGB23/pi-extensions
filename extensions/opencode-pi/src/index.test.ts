@@ -2130,6 +2130,52 @@ test("streamOpenCode reuses the session and sends only the transcript delta", as
   }
 });
 
+// Real OpenCode v2.1.1 `run --format json` events; v2.1.1 sometimes exits
+// without the step_finish event, so `finish` toggles it.
+function v2UsageFakeScript(capturePath: string, finish: boolean): string {
+  const sid = "ses_ea5cd2e65ffe12nAkoYiqvThnj";
+  const events = [
+    { type: "step_start", sessionID: sid, part: { sessionID: sid, type: "step-start" } },
+    { type: "text", sessionID: sid, part: { sessionID: sid, type: "text", text: "ut-teal-7731" } },
+    ...(finish ? [{ type: "step_finish", sessionID: sid, part: { sessionID: sid, type: "step-finish", reason: "stop", cost: 0, tokens: { input: 271, output: 10, reasoning: 9, cache: { read: 7168, write: 0 } } } }] : []),
+  ];
+  return `if (process.argv.includes("session")) process.exit(0);
+require("node:fs").appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args: process.argv.slice(2), stdin: "" }) + "\\n");
+process.stdin.resume();
+process.stdin.on("end", () => process.stdout.write(${JSON.stringify(events.map((event) => JSON.stringify(event)).join("\n") + "\n")}));
+`;
+}
+
+test("streamOpenCode reports v2 continuation cache usage, or estimates the full context", async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const capturePath = join(captureDir, "invocations.jsonl");
+  const piSessionId = `pi-v2-usage-${Date.now()}`;
+  const turn = (texts: string[], finish: boolean) =>
+    withFakeOpenCode(v2UsageFakeScript(capturePath, finish), () =>
+      streamOpenCode(fakeModel(), conversation(texts), { sessionId: piSessionId }).result(), "opencode v2.1.1");
+  const conversation = (texts: string[]) => ({
+    messages: texts.map((text, index) => index % 2
+      ? { role: "assistant", content: [{ type: "text", text }], timestamp: index + 1 }
+      : { role: "user", content: text, timestamp: index + 1 }),
+  }) as unknown as Context;
+  const first = `remember ${"context ".repeat(2000)}`;
+  try {
+    const fresh = await turn([first], false);
+    const reported = await turn([first, "ut-teal-7731", "colour?"], true);
+    assert.deepEqual(
+      [reported.usage.input, reported.usage.output, reported.usage.cacheRead, reported.usage.cacheWrite],
+      [271, 19, 7168, 0],
+    );
+    const estimated = await turn([first, "ut-teal-7731", "colour?", "ut-teal-7731", "again?"], false);
+    assert.equal(readInvocations(capturePath).filter((call) => call.args.includes("--session")).length, 2);
+    // Without step_finish the estimate covers the whole conversation, not the delta.
+    assert.ok(estimated.usage.input >= fresh.usage.input, `${estimated.usage.input} < ${fresh.usage.input}`);
+  } finally {
+    await cleanupPiSessionState(piSessionId);
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
 test("streamOpenCode starts fresh after an error drops the session", async () => {
   const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");

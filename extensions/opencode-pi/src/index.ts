@@ -2603,10 +2603,14 @@ export function streamOpenCode(
           `OpenCode returned empty assistant response (${rawTextPreview}; ${rawThinkingPreview}). This can happen with some free models when the prompt is too long, the model times out, or the model is overloaded. Retry the request or select another OpenCode model.`,
         );
       }
+      // OpenCode v2.1 sometimes exits without its step_finish usage event.
+      // A continuation only sent the delta, so estimate from the full
+      // context the session holds, not the delta, or the context meter
+      // collapses.
       setEstimatedUsage(
         model,
         output,
-        prompt,
+        isContinuation ? buildPrompt(context) : prompt,
         accumulatedText + accumulatedThinking,
       );
       // The turn succeeded: record the session for reuse, or delete the
