@@ -1853,8 +1853,20 @@ export function agentDefinition(dialect: CliDialect): string {
   return dialect === "v2" ? AGENT_V2 : AGENT_V1;
 }
 
+// OpenCode v2.1.1 also refuses with "Permission denied: <rule>" (e.g. a read
+// outside the project directory) and "No tool named ..." (a tool the agent
+// does not declare). The first is anchored so an OS error such as
+// "EACCES: permission denied, open ..." still counts as executed.
 const OPENCODE_PERMISSION_REJECTION =
-  /cannot ask the user for permission|request was rejected|rejected permission|user rejected/i;
+  /cannot ask the user for permission|request was rejected|rejected permission|user rejected|^permission denied: [\w.-]+$|^no tool named "[^"]*" is currently available/i;
+
+/** Whether a native tool's error state is OpenCode refusing it before it ran. */
+function isRefusedTool(toolState: { status?: string; error?: unknown } | undefined): boolean {
+  if (toolState?.status !== "error") return false;
+  const error = toolState.error as { message?: unknown } | string | undefined;
+  const text = typeof error === "object" && error !== null ? error.message : error;
+  return OPENCODE_PERMISSION_REJECTION.test(String(text ?? ""));
+}
 
 async function createTempAgentDir(dialect: CliDialect): Promise<string> {
   // realpath keeps PWD and the spawn cwd identical where tmpdir is a symlink
@@ -2019,11 +2031,7 @@ export async function runOpenCodeTurn(params: {
       // false for every tool OpenCode runs locally, so it says nothing about
       // refusal. Only OpenCode's permission-rejection error counts; a tool
       // that ran and failed (e.g. EACCES "permission denied") still executed.
-      const toolState = event.part?.state;
-      const refused =
-        toolState?.status === "error" &&
-        OPENCODE_PERMISSION_REJECTION.test(String(toolState?.error ?? ""));
-      if (!refused) {
+      if (!isRefusedTool(event.part?.state)) {
         state.toolUse = event.part?.tool ? String(event.part.tool) : "unknown";
       }
       return;
@@ -2189,10 +2197,7 @@ export async function runOpenCodeServerTurn(params: {
       if (part.type === "tool" && (part.state?.status === "completed" || part.state?.status === "error")) {
         // Same rule as `opencode run`: a refused OpenCode tool changed
         // nothing, a tool that executed fails the turn.
-        const refused =
-          part.state.status === "error" &&
-          OPENCODE_PERMISSION_REJECTION.test(String(part.state.error ?? ""));
-        if (!refused) state.toolUse = part.tool ? String(part.tool) : "unknown";
+        if (!isRefusedTool(part.state)) state.toolUse = part.tool ? String(part.tool) : "unknown";
       }
       return false;
     }

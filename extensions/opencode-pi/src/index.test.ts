@@ -759,6 +759,25 @@ test("streamOpenCode continues when OpenCode refused its own tool before it ran"
   );
 });
 
+test("streamOpenCode continues after OpenCode v2.1.1 refusals", async () => {
+  const refusals: unknown[] = [
+    "Permission denied: external_directory",
+    { type: "permission.rejected", message: "Permission denied: external_directory" },
+    'No tool named "bash" is currently available. Use one of the available tools instead.',
+  ];
+  for (const error of refusals) {
+    const message = await withFakeOpenCode(
+      fakeEventScript([
+        { type: "tool_use", part: { tool: "read", state: { status: "error", error } } },
+        { type: "text", part: { text: "used the Pi read tool instead" } },
+      ]),
+      () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
+    );
+    assert.equal(message.stopReason, "stop", JSON.stringify(error));
+    assert.equal(message.errorMessage, undefined, JSON.stringify(error));
+  }
+});
+
 test("streamOpenCode fails when OpenCode completed a locally executed native tool", async () => {
   const message = await withFakeOpenCode(
     fakeEventScript([
