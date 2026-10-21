@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install
+        working-directory: extensions/opencode-pi
+        run: pnpm install --ignore-scripts
+
+      - name: Build
+        working-directory: extensions/opencode-pi
+        run: pnpm exec tsc
+
+      - name: Test
+        working-directory: extensions/opencode-pi
+        run: node --test dist/*.test.js
