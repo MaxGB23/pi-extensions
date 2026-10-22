@@ -29,30 +29,89 @@ process.on("SIGTERM", stop);
 child.on("exit", (code) => process.exit(code ?? 1));
 child.on("error", (error) => { console.error(String(error)); process.exit(1); });`;
 
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost"]);
+
+/**
+ * Accept only an origin the bridge itself started. The banner is child output,
+ * so an unexpected line must never receive the password.
+ */
+export function validateServerOrigin(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("opencode serve reported an unparsable URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw new Error(`opencode serve reported an unsupported protocol: ${url.protocol}`);
+  }
+  if (url.username || url.password) {
+    throw new Error("opencode serve reported a URL that carries credentials");
+  }
+  if (!LOOPBACK_HOSTS.has(url.hostname)) {
+    throw new Error(
+      `opencode serve reported a non-loopback origin: ${url.protocol}//${url.hostname}`,
+    );
+  }
+  const port = Number(url.port);
+  if (!url.port || !Number.isInteger(port) || port < 1 || port > 65_535) {
+    throw new Error(`opencode serve reported an invalid port: ${url.port || "(none)"}`);
+  }
+  return url.origin;
+}
+
+/** Remove the server password from output that may reach the user. */
+export function redactSecret(text: string, secret: string): string {
+  if (!secret) return text;
+  return text.split(secret).join("***");
+}
+
 export type OpenCodeServer = {
   bin: string;
   url: string;
   authorization: string;
   child: ChildProcess;
+  /** Whether the server was started with `--pure` (OpenCode v1 only). */
+  pure: boolean;
 };
 
-export type ServerEvent = { type: string; properties?: any };
+export type ServerEvent = { type: string; properties?: any; data?: any };
+
+/** `--pure` exists only in OpenCode v1, so the dialect decides it. */
+export type LaunchOptions = { pure?: boolean };
+
+/**
+ * Thrown when the event stream ends before the server's connect frame. The
+ * caller can recognize it by type instead of by message text.
+ */
+export class EventStreamClosedBeforeConnect extends Error {
+  constructor() {
+    super("OpenCode event stream closed before it connected");
+    this.name = "EventStreamClosedBeforeConnect";
+  }
+}
 
 let server: Promise<OpenCodeServer> | undefined;
 let running: OpenCodeServer | undefined;
 let activeUses = 0;
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
-function launch(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
+export function launch(
+  bin: string,
+  env: NodeJS.ProcessEnv,
+  spawnChild: typeof spawn = spawn,
+  options: LaunchOptions = {},
+): Promise<OpenCodeServer> {
   const password = randomBytes(24).toString("hex");
-  const child = spawn(process.execPath, ["-e", WATCHDOG], {
+  const pure = options.pure ?? true;
+  const child = spawnChild(process.execPath, ["-e", WATCHDOG], {
     stdio: ["pipe", "pipe", "pipe"],
     env: {
       ...env,
       // Lets a compiled Bun host run the watchdog script as plain bun.
       BUN_BE_BUN: "1",
       OPENCODE_PI_SERVE_ARGV: JSON.stringify([
-        bin, "serve", "--pure", "--hostname", "127.0.0.1", "--port", "0",
+        bin, "serve", ...(pure ? ["--pure"] : []), "--hostname", "127.0.0.1", "--port", "0",
       ]),
       OPENCODE_SERVER_USERNAME: "opencode",
       OPENCODE_SERVER_PASSWORD: password,
@@ -60,10 +119,14 @@ function launch(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
   });
   return new Promise((resolve, reject) => {
     let output = "";
+    let settled = false;
     const fail = (message: string) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       child.kill("SIGTERM");
-      reject(new Error(`${message}${output.trim() ? `: ${output.trim()}` : ""}`));
+      const tail = redactSecret(output.trim(), password);
+      reject(new Error(`${message}${tail ? `: ${tail}` : ""}`));
     };
     const timer = setTimeout(
       () => fail(`opencode serve did not start within ${START_TIMEOUT_MS}ms`),
@@ -74,9 +137,17 @@ function launch(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
       // Once ready, the listener only keeps the pipes drained.
       if (ready) return;
       output = (output + chunk.toString()).slice(-OUTPUT_LIMIT);
-      const url = output.match(/listening on (https?:\/\/\S+)/)?.[1];
-      if (!url) return;
+      const raw = output.match(/listening on (https?:\/\/\S+)/)?.[1];
+      if (!raw) return;
+      let url: string;
+      try {
+        url = validateServerOrigin(raw);
+      } catch (error) {
+        fail((error as Error).message);
+        return;
+      }
       ready = true;
+      settled = true;
       clearTimeout(timer);
       child.removeListener("exit", onExit);
       child.on("exit", () => forget(instance));
@@ -85,6 +156,7 @@ function launch(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
         url,
         authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
         child,
+        pure,
       };
       // The server must not keep Pi alive; the watchdog stops it on exit.
       child.unref();
@@ -108,13 +180,18 @@ function forget(instance: OpenCodeServer): void {
   server = undefined;
 }
 
-async function ensureServer(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
+async function ensureServer(
+  bin: string,
+  env: NodeJS.ProcessEnv,
+  options: LaunchOptions,
+): Promise<OpenCodeServer> {
+  const pure = options.pure ?? true;
   const current = await server?.catch(() => undefined);
-  if (current && current.bin === bin && current.child.exitCode === null) {
+  if (current && current.bin === bin && current.pure === pure && current.child.exitCode === null) {
     return current;
   }
   if (current) stopOpenCodeServer();
-  const started = launch(bin, env);
+  const started = launch(bin, env, spawn, options);
   server = started;
   try {
     running = await started;
@@ -133,12 +210,13 @@ export async function withOpenCodeServer<T>(
   bin: string,
   env: NodeJS.ProcessEnv,
   use: (server: OpenCodeServer) => Promise<T>,
+  options: LaunchOptions = {},
 ): Promise<T> {
   activeUses += 1;
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = undefined;
   try {
-    return await use(await ensureServer(bin, env));
+    return await use(await ensureServer(bin, env, options));
   } finally {
     activeUses -= 1;
     if (activeUses === 0) {
@@ -197,14 +275,17 @@ export async function serverRequest(
 /**
  * Subscribe to the directory's event stream. Resolves once the server has
  * confirmed the subscription, so no event published after that is missed.
+ * OpenCode v1 serves it at `/event`, v2 at `/api/event`; both open with
+ * `server.connected`.
  */
 export async function subscribeEvents(
   server: OpenCodeServer,
   directory: string,
   signal: AbortSignal,
+  path = "/event",
 ): Promise<AsyncGenerator<ServerEvent>> {
   const response = await fetch(
-    `${server.url}/event?directory=${encodeURIComponent(directory)}`,
+    `${server.url}${path}?directory=${encodeURIComponent(directory)}`,
     { headers: { authorization: server.authorization, accept: "text/event-stream" }, signal },
   );
   if (!response.ok || !response.body) {
@@ -213,7 +294,7 @@ export async function subscribeEvents(
   const events = parseEvents(response.body);
   const first = await events.next();
   if (first.done || first.value.type !== "server.connected") {
-    throw new Error("OpenCode event stream closed before it connected");
+    throw new EventStreamClosedBeforeConnect();
   }
   return events;
 }
