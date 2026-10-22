@@ -77,6 +77,21 @@ test("launch rejects a non-loopback banner before resolving a server", async () 
   assert.equal(killed, true, "the rejected server is stopped");
 });
 
+test("launch rejects when the server exits before it prints a banner", async () => {
+  const child = fakeChild();
+  let killed = false;
+  child.kill = () => {
+    killed = true;
+    return true;
+  };
+  const started = launch("opencode", {}, fakeSpawn(child));
+  child.emit("exit", 1);
+  // This rejection is what makes `streamOpenCode` fall back to `opencode run`:
+  // the use callback never runs, so its `serverStarted` flag stays false.
+  await assert.rejects(started, /exited with code 1 before it was ready/);
+  assert.equal(killed, true, "a server that never started is not left behind");
+});
+
 test("launch resolves a loopback banner and only then builds the authorization", async () => {
   const child = fakeChild();
   const started = launch("opencode", {}, fakeSpawn(child));
@@ -84,6 +99,57 @@ test("launch resolves a loopback banner and only then builds the authorization",
   const server = await started;
   assert.equal(server.url, "http://127.0.0.1:4096");
   assert.match(server.authorization, /^Basic /);
+});
+
+function capturingSpawn(child: ChildProcess, argv: string[][]): typeof spawn {
+  return ((
+    _command: string,
+    _args: readonly string[],
+    options: { env: NodeJS.ProcessEnv },
+  ) => {
+    argv.push(JSON.parse(String(options.env.OPENCODE_PI_SERVE_ARGV)));
+    return child;
+  }) as unknown as typeof spawn;
+}
+
+async function launchArgv(options: { pure?: boolean } = {}): Promise<{
+  argv: string[];
+  pure: boolean;
+}> {
+  const child = fakeChild();
+  const seen: string[][] = [];
+  const started = launch("opencode", {}, capturingSpawn(child, seen), options);
+  child.stdout.emit("data", Buffer.from("listening on http://127.0.0.1:4096\n"));
+  const server = await started;
+  return { argv: seen[0]!, pure: server.pure };
+}
+
+test("launch starts the v1 server with --pure", async () => {
+  const { argv, pure } = await launchArgv();
+  assert.equal(pure, true);
+  assert.deepEqual(argv, [
+    "opencode",
+    "serve",
+    "--pure",
+    "--hostname",
+    "127.0.0.1",
+    "--port",
+    "0",
+  ]);
+});
+
+test("launch starts the v2 server without --pure", async () => {
+  const { argv, pure } = await launchArgv({ pure: false });
+  assert.equal(pure, false);
+  assert.ok(!argv.includes("--pure"), "--pure does not exist on v2");
+  assert.deepEqual(argv, [
+    "opencode",
+    "serve",
+    "--hostname",
+    "127.0.0.1",
+    "--port",
+    "0",
+  ]);
 });
 
 test("redactSecret removes the password in every form it can appear", () => {

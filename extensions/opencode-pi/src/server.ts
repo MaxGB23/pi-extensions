@@ -71,9 +71,25 @@ export type OpenCodeServer = {
   url: string;
   authorization: string;
   child: ChildProcess;
+  /** Whether the server was started with `--pure` (OpenCode v1 only). */
+  pure: boolean;
 };
 
-export type ServerEvent = { type: string; properties?: any };
+export type ServerEvent = { type: string; properties?: any; data?: any };
+
+/** `--pure` exists only in OpenCode v1, so the dialect decides it. */
+export type LaunchOptions = { pure?: boolean };
+
+/**
+ * Thrown when the event stream ends before the server's connect frame. The
+ * caller can recognize it by type instead of by message text.
+ */
+export class EventStreamClosedBeforeConnect extends Error {
+  constructor() {
+    super("OpenCode event stream closed before it connected");
+    this.name = "EventStreamClosedBeforeConnect";
+  }
+}
 
 let server: Promise<OpenCodeServer> | undefined;
 let running: OpenCodeServer | undefined;
@@ -84,8 +100,10 @@ export function launch(
   bin: string,
   env: NodeJS.ProcessEnv,
   spawnChild: typeof spawn = spawn,
+  options: LaunchOptions = {},
 ): Promise<OpenCodeServer> {
   const password = randomBytes(24).toString("hex");
+  const pure = options.pure ?? true;
   const child = spawnChild(process.execPath, ["-e", WATCHDOG], {
     stdio: ["pipe", "pipe", "pipe"],
     env: {
@@ -93,7 +111,7 @@ export function launch(
       // Lets a compiled Bun host run the watchdog script as plain bun.
       BUN_BE_BUN: "1",
       OPENCODE_PI_SERVE_ARGV: JSON.stringify([
-        bin, "serve", "--pure", "--hostname", "127.0.0.1", "--port", "0",
+        bin, "serve", ...(pure ? ["--pure"] : []), "--hostname", "127.0.0.1", "--port", "0",
       ]),
       OPENCODE_SERVER_USERNAME: "opencode",
       OPENCODE_SERVER_PASSWORD: password,
@@ -138,6 +156,7 @@ export function launch(
         url,
         authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
         child,
+        pure,
       };
       // The server must not keep Pi alive; the watchdog stops it on exit.
       child.unref();
@@ -161,13 +180,18 @@ function forget(instance: OpenCodeServer): void {
   server = undefined;
 }
 
-async function ensureServer(bin: string, env: NodeJS.ProcessEnv): Promise<OpenCodeServer> {
+async function ensureServer(
+  bin: string,
+  env: NodeJS.ProcessEnv,
+  options: LaunchOptions,
+): Promise<OpenCodeServer> {
+  const pure = options.pure ?? true;
   const current = await server?.catch(() => undefined);
-  if (current && current.bin === bin && current.child.exitCode === null) {
+  if (current && current.bin === bin && current.pure === pure && current.child.exitCode === null) {
     return current;
   }
   if (current) stopOpenCodeServer();
-  const started = launch(bin, env);
+  const started = launch(bin, env, spawn, options);
   server = started;
   try {
     running = await started;
@@ -186,12 +210,13 @@ export async function withOpenCodeServer<T>(
   bin: string,
   env: NodeJS.ProcessEnv,
   use: (server: OpenCodeServer) => Promise<T>,
+  options: LaunchOptions = {},
 ): Promise<T> {
   activeUses += 1;
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = undefined;
   try {
-    return await use(await ensureServer(bin, env));
+    return await use(await ensureServer(bin, env, options));
   } finally {
     activeUses -= 1;
     if (activeUses === 0) {
@@ -250,14 +275,17 @@ export async function serverRequest(
 /**
  * Subscribe to the directory's event stream. Resolves once the server has
  * confirmed the subscription, so no event published after that is missed.
+ * OpenCode v1 serves it at `/event`, v2 at `/api/event`; both open with
+ * `server.connected`.
  */
 export async function subscribeEvents(
   server: OpenCodeServer,
   directory: string,
   signal: AbortSignal,
+  path = "/event",
 ): Promise<AsyncGenerator<ServerEvent>> {
   const response = await fetch(
-    `${server.url}/event?directory=${encodeURIComponent(directory)}`,
+    `${server.url}${path}?directory=${encodeURIComponent(directory)}`,
     { headers: { authorization: server.authorization, accept: "text/event-stream" }, signal },
   );
   if (!response.ok || !response.body) {
@@ -266,7 +294,7 @@ export async function subscribeEvents(
   const events = parseEvents(response.body);
   const first = await events.next();
   if (first.done || first.value.type !== "server.connected") {
-    throw new Error("OpenCode event stream closed before it connected");
+    throw new EventStreamClosedBeforeConnect();
   }
   return events;
 }
