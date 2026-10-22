@@ -116,6 +116,16 @@ This queries OpenCode for model metadata (`opencode api GET /api/model` on OpenC
 | `OPENCODE_PI_MODELS` | Comma- or space-separated model list to register. Values without `/` are prefixed with `opencode/`. Registers immediately with conservative fallback metadata (skipping discovery so startup never pays a discovery timeout); run `/opencode-pi update` to enrich these models with real capabilities and cost from discovery. |
 | `OPENCODE_PI_STREAM` | Set to `0` to run turns through `opencode run` instead of streaming them through `opencode serve`. Applies to both CLI dialects. |
 
+To find the real executable behind an npm-managed install:
+
+```powershell
+npm root -g   # then @opencode\cli\bin\opencode.exe under that root
+```
+
+On Windows, point `OPENCODE_PI_BIN` at that `.exe`: the file of the same name
+in the npm prefix's `bin` directory is only a `.cmd` shim and cannot be
+spawned.
+
 Example:
 
 ```bash
