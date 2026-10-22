@@ -2886,7 +2886,11 @@ export function streamOpenCode(
           }
           // `opencode serve` did not start, or (v2) its event stream closed
           // before `server.connected`; this CLI runs every turn through
-          // `opencode run` instead.
+          // `opencode run` instead. Nothing the server produced is used from
+          // here on, so the finalizer must read the `opencode run` reply: with
+          // `streamed` still set, the fallback's text was dropped and the turn
+          // failed as an empty response.
+          streamed = false;
           serverUnavailableFor = bin;
           if (dialect === "v2") {
             // One notice: the turn still answers, but without streaming.
