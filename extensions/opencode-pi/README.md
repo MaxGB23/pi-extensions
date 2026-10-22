@@ -27,6 +27,12 @@ opencode --version
 opencode models
 ```
 
+If those commands work in your shell but the extension reports that OpenCode
+is missing, set `OPENCODE_PI_BIN` to the real executable (see Configuration).
+The extension spawns the binary directly, without a shell, so a `.cmd` or
+`.ps1` shim on `PATH` cannot be started on Windows, and a custom install that
+is not on `PATH` is never found.
+
 No OpenCode login is required for the bundled free OpenCode models.
 
 When the extension loads it registers the models from the last discovery
@@ -106,7 +112,7 @@ This queries OpenCode for model metadata (`opencode api GET /api/model` on OpenC
 
 | Environment variable | Description                                                                                         |
 | -------------------- | --------------------------------------------------------------------------------------------------- |
-| `OPENCODE_PI_BIN`    | Override the OpenCode executable path. Defaults to `opencode`.                                      |
+| `OPENCODE_PI_BIN`    | Path to the OpenCode executable. Defaults to `opencode`, resolved through `PATH` without a shell: on Windows an npm-installed OpenCode leaves only an `opencode.cmd` / `opencode.ps1` shim there, which cannot be spawned, and a custom install outside `PATH` is never found, so point this at the real `opencode.exe`. |
 | `OPENCODE_PI_MODELS` | Comma- or space-separated model list to register. Values without `/` are prefixed with `opencode/`. Registers immediately with conservative fallback metadata (skipping discovery so startup never pays a discovery timeout); run `/opencode-pi update` to enrich these models with real capabilities and cost from discovery. |
 | `OPENCODE_PI_STREAM` | Set to `0` to run turns through `opencode run` instead of streaming them through `opencode serve`. Applies to both CLI dialects. |
 
