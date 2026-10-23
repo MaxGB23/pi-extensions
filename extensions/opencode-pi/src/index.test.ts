@@ -2,13 +2,14 @@ import assert from "node:assert/strict";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -40,6 +41,7 @@ import opencodePiExtension, {
   parseToolCalls,
   parseVerboseModels,
   reasoningCliArgs,
+  resolveOpencodeBinary,
   resolveTurnSystemPrompt,
   resolveTurnTimeoutMs,
   resolveTurnTools,
@@ -2963,4 +2965,112 @@ test("streamOpenCode survives messages with null or non-array content", async ()
   );
 
   assert.equal(message.stopReason, "stop");
+});
+
+// Binary resolution must behave like a shell. `spawn("opencode")` cannot run the
+// npm `.cmd` shim on Windows, so the default resolver follows the shim to the
+// executable it calls instead of handing a batch file to `spawn()`.
+test("resolveOpencodeBinary prefers OPENCODE_PI_BIN and trims it", () => {
+  assert.equal(
+    resolveOpencodeBinary({ OPENCODE_PI_BIN: "  C:\\tools\\opencode.exe  " }, "win32", () => false),
+    "C:\\tools\\opencode.exe",
+  );
+});
+
+test("resolveOpencodeBinary returns the bare command off Windows", () => {
+  assert.equal(resolveOpencodeBinary({ PATH: "/usr/local/bin" }, "linux", () => true), "opencode");
+});
+
+test("resolveOpencodeBinary walks PATH in order and probes each PATHEXT extension", () => {
+  const probes: string[] = [];
+  const shimDir = "C:\\Users\\me\\AppData\\Roaming\\npm";
+  const bin = resolveOpencodeBinary(
+    { PATH: `C:\\empty;${shimDir}`, PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+    "win32",
+    (candidate) => {
+      probes.push(candidate);
+      return candidate === join(shimDir, "opencode.EXE");
+    },
+  );
+  assert.equal(bin, join(shimDir, "opencode.EXE"));
+  assert.equal(probes[0], join("C:\\empty", "opencode.COM"));
+  assert.deepEqual(probes.slice(-2), [
+    join(shimDir, "opencode.COM"),
+    join(shimDir, "opencode.EXE"),
+  ]);
+});
+
+test("resolveOpencodeBinary never returns a batch file it cannot execute", () => {
+  const bin = resolveOpencodeBinary(
+    { PATH: "C:\\bin", PATHEXT: ".CMD" },
+    "win32",
+    (candidate) => candidate.toLowerCase().endsWith(".cmd"),
+  );
+  assert.equal(bin, "opencode");
+});
+
+test("resolveOpencodeBinary unwraps quoted PATH entries and skips empty ones", () => {
+  const nodeDir = "C:\\Program Files\\nodejs";
+  const bin = resolveOpencodeBinary(
+    { PATH: `"";"${nodeDir}"`, PATHEXT: ".EXE" },
+    "win32",
+    (candidate) => candidate === join(nodeDir, "opencode.EXE"),
+  );
+  assert.equal(bin, join(nodeDir, "opencode.EXE"));
+});
+
+test("resolveOpencodeBinary follows an npm shim to the executable it calls", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-shim-"));
+  const shim = join(prefix, "opencode.cmd");
+  const target = join(prefix, "node_modules", "@opencode", "cli", "bin", "opencode.exe");
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "");
+    writeFileSync(
+      shim,
+      [
+        "@ECHO off",
+        "GOTO start",
+        ":find_dp0",
+        "SET dp0=%~dp0",
+        "EXIT /b",
+        ":start",
+        "SETLOCAL",
+        "CALL :find_dp0",
+        '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*',
+        "",
+      ].join("\r\n"),
+    );
+
+    const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".CMD" }, "win32");
+
+    assert.equal(bin, target);
+    assert.equal(existsSync(bin), true);
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
+});
+
+test("resolveOpencodeBinary falls back to the bare command when nothing exists", () => {
+  assert.equal(
+    resolveOpencodeBinary({ PATH: "C:\\bin", PATHEXT: ".CMD" }, "win32", () => false),
+    "opencode",
+  );
+});
+
+test("resolveOpencodeBinary falls back when the shim names a missing executable", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-broken-shim-"));
+  const shim = join(prefix, "opencode.cmd");
+  try {
+    writeFileSync(
+      shim,
+      '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*\r\n',
+    );
+
+    const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".CMD" }, "win32");
+
+    assert.equal(bin, "opencode");
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
 });

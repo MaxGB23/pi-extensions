@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -260,8 +260,66 @@ async function writeModelCache(models: OpenCodeModelInfo[]): Promise<void> {
   await writeFile(path, JSON.stringify({ bin: opencodeBin(), models }), "utf8");
 }
 
+/**
+ * Resolve the OpenCode executable the way a shell would.
+ *
+ * `OPENCODE_PI_BIN` wins whenever it holds a value. Off Windows the bare
+ * command is used, because a POSIX `PATH` lookup already works. On Windows the
+ * command is looked up in `PATH` with each `PATHEXT` extension, and a `.cmd`
+ * shim is followed to the executable it calls: `spawn()` cannot run a batch
+ * file without a shell, and putting these arguments through a shell would add
+ * quoting and injection surface for values such as the server password.
+ */
+export function resolveOpencodeBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  exists: (path: string) => boolean = existsSync,
+): string {
+  const configured = env.OPENCODE_PI_BIN?.trim();
+  if (configured) return configured;
+  if (platform !== "win32") return "opencode";
+  const pathValue = env.PATH ?? env.Path ?? "";
+  const extensions = (env.PATHEXT?.trim() || ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((extension) => extension.trim())
+    .filter(Boolean);
+  for (const entry of pathValue.split(";")) {
+    const directory = entry.trim().replace(/^"(.*)"$/, "$1");
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = join(directory, `opencode${extension}`);
+      if (!exists(candidate)) continue;
+      if (!/\.(cmd|bat)$/i.test(candidate)) return candidate;
+      const target = shimTarget(candidate, exists);
+      if (target) return target;
+    }
+  }
+  return "opencode";
+}
+
+/**
+ * Follow an npm-style `.cmd` shim to the executable it calls, so the result can
+ * be spawned directly. Returns `undefined` when the shim does not name an
+ * existing `.exe`/`.com`, which leaves the previous behaviour in place.
+ */
+function shimTarget(
+  shimPath: string,
+  exists: (path: string) => boolean,
+): string | undefined {
+  let text: string;
+  try {
+    text = readFileSync(shimPath, "utf8");
+  } catch {
+    return undefined;
+  }
+  const match = /%(?:~?dp0)%[\\/]([^"%\r\n]+?\.(?:exe|com))"?(?=\s|$)/i.exec(text);
+  if (!match?.[1]) return undefined;
+  const target = join(dirname(shimPath), ...match[1].split(/[\\/]+/).filter(Boolean));
+  return exists(target) ? target : undefined;
+}
+
 function opencodeBin(): string {
-  return process.env.OPENCODE_PI_BIN?.trim() || "opencode";
+  return resolveOpencodeBinary();
 }
 
 /** OpenCode v1 turns stream through `opencode serve` unless OPENCODE_PI_STREAM is off. */
