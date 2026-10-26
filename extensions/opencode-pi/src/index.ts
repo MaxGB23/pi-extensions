@@ -261,30 +261,36 @@ async function writeModelCache(models: OpenCodeModelInfo[]): Promise<void> {
 }
 
 /**
- * Resolve the OpenCode executable the way a shell would.
+ * Resolve how to launch the OpenCode CLI the way a shell would.
+ *
+ * The result is a command plus the arguments that must precede the user's own:
+ * a native executable needs none, while an npm/pnpm shim that launches a
+ * JavaScript entrypoint needs `node <cli.js>` in front of them, because
+ * `spawn()` cannot run a batch file and does not interpret one.
  *
  * `OPENCODE_PI_BIN` wins whenever it holds a value, and a value pointing at a
- * `.cmd`/`.bat` shim is followed to the executable it calls for the same reason
- * the `PATH` lookup below follows one. Off Windows the bare command is used,
- * because a POSIX `PATH` lookup already works. On Windows the command is looked
- * up in `PATH` with each `PATHEXT` extension, and a `.cmd` shim is followed to
- * the executable it calls: `spawn()` cannot run a batch file without a shell,
- * and putting these arguments through a shell would add quoting and injection
+ * `.cmd`/`.bat` shim is expanded for the same reason the `PATH` lookup below
+ * expands one. Off Windows the bare command is used, because a POSIX `PATH`
+ * lookup already works. On Windows the command is looked up in `PATH` with each
+ * `PATHEXT` extension, and a `.cmd` shim is followed to the executable it calls:
+ * putting these arguments through a shell would add quoting and injection
  * surface for values such as the server password.
  */
-export function resolveOpencodeBinary(
+export type OpenCodeCommand = { command: string; args: string[] };
+
+export function resolveOpencodeCommand(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
   exists: (path: string) => boolean = existsSync,
-): string {
+): OpenCodeCommand {
   const configured = env.OPENCODE_PI_BIN?.trim();
   if (configured) {
     if (platform === "win32" && /\.(cmd|bat)$/i.test(configured)) {
-      return shimTarget(configured, exists) ?? configured;
+      return shimCommand(configured, exists) ?? { command: configured, args: [] };
     }
-    return configured;
+    return { command: configured, args: [] };
   }
-  if (platform !== "win32") return "opencode";
+  if (platform !== "win32") return { command: "opencode", args: [] };
   const pathValue = env.PATH ?? env.Path ?? "";
   const extensions = (env.PATHEXT?.trim() || ".COM;.EXE;.BAT;.CMD")
     .split(";")
@@ -296,37 +302,87 @@ export function resolveOpencodeBinary(
     for (const extension of extensions) {
       const candidate = join(directory, `opencode${extension}`);
       if (!exists(candidate)) continue;
-      if (!/\.(cmd|bat)$/i.test(candidate)) return candidate;
-      const target = shimTarget(candidate, exists);
-      if (target) return target;
+      if (!/\.(cmd|bat)$/i.test(candidate)) return { command: candidate, args: [] };
+      const viaShim = shimCommand(candidate, exists);
+      if (viaShim) return viaShim;
     }
   }
-  return "opencode";
+  return { command: "opencode", args: [] };
+}
+
+/** The command alone, for logs, cache keys and messages. */
+export function resolveOpencodeBinary(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  exists: (path: string) => boolean = existsSync,
+): string {
+  return resolveOpencodeCommand(env, platform, exists).command;
 }
 
 /**
- * Follow an npm-style `.cmd` shim to the executable it calls, so the result can
- * be spawned directly. Returns `undefined` when the shim does not name an
- * existing `.exe`/`.com`, which leaves the previous behaviour in place.
+ * Expand an npm-style `.cmd` shim into a command `spawn()` can run.
+ *
+ * Only the line carrying the invocation (`%*`) is read, so a helper such as
+ * `node.exe` mentioned in an `IF EXIST` guard can never be mistaken for the
+ * target. `SET "NAME=value"` assignments are substituted once, which covers
+ * both `cmd-shim` shapes: `"%dp0%\node_modules\...\cli.exe" %*` and
+ * `"%NODE_EXE%" "%CLI_JS%" %*` with `node` and a `.js` entrypoint.
+ * Returns `undefined` when the shim names nothing runnable, which leaves the
+ * earlier behaviour in place instead of guessing.
  */
-function shimTarget(
+function shimCommand(
   shimPath: string,
   exists: (path: string) => boolean,
-): string | undefined {
+): OpenCodeCommand | undefined {
   let text: string;
   try {
     text = readFileSync(shimPath, "utf8");
   } catch {
     return undefined;
   }
-  const match = /%(?:~?dp0)%[\\/]([^"%\r\n]+?\.(?:exe|com))"?(?=\s|$)/i.exec(text);
-  if (!match?.[1]) return undefined;
-  const target = join(dirname(shimPath), ...match[1].split(/[\\/]+/).filter(Boolean));
-  return exists(target) ? target : undefined;
+  const lines = text.split(/\r?\n/);
+  const variables = new Map<string, string>();
+  for (const line of lines) {
+    const assignment = /^\s*SET\s+"([^"]+)=([^"]*)"/i.exec(line);
+    if (assignment?.[1]) variables.set(assignment[1].toUpperCase(), assignment[2] ?? "");
+  }
+  const shimDir = dirname(shimPath);
+  const expand = (value: string): string => {
+    const withVariables = value.replace(/%([^%]+)%/g, (whole, name: string) =>
+      variables.get(name.toUpperCase()) ?? whole,
+    );
+    return withVariables.replace(/%~?dp0%?/gi, shimDir);
+  };
+  const invocation = [...lines].reverse().find((line) => line.includes("%*"));
+  if (!invocation) return undefined;
+  const tokens = [...expand(invocation).matchAll(/"([^"]+)"|(\S+)/g)].map(
+    (match) => match[1] ?? match[2] ?? "",
+  );
+  const program = tokens[0];
+  if (!program) return undefined;
+  if (/^(?:.*[\\/])?node(?:\.exe)?$/i.test(program)) {
+    const script = tokens.slice(1).find((token) => /\.(?:js|cjs|mjs)$/i.test(token));
+    if (!script || !exists(script)) return undefined;
+    const sibling = join(shimDir, "node.exe");
+    const node = /\.exe$/i.test(program) && exists(program)
+      ? program
+      : exists(sibling)
+        ? sibling
+        : "node";
+    return { command: node, args: [script] };
+  }
+  if (/\.(?:exe|com)$/i.test(program) && exists(program)) {
+    return { command: program, args: [] };
+  }
+  return undefined;
+}
+
+function opencodeCommand(): OpenCodeCommand {
+  return resolveOpencodeCommand();
 }
 
 function opencodeBin(): string {
-  return resolveOpencodeBinary();
+  return opencodeCommand().command;
 }
 
 /** OpenCode v1 turns stream through `opencode serve` unless OPENCODE_PI_STREAM is off. */
@@ -653,7 +709,8 @@ function runCapture(
   timeoutMs = DISCOVERY_TIMEOUT_MS,
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
   return new Promise((resolve, reject) => {
-    const child = spawn(opencodeBin(), args, {
+    const launcher = opencodeCommand();
+    const child = spawn(launcher.command, [...launcher.args, ...args], {
       stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
     });
@@ -1706,7 +1763,8 @@ export function resolveTurnTimeoutMs(timeoutMs: unknown): number {
 export function deleteOpenCodeSession(sessionId: string | undefined): void {
   if (!sessionId) return;
   try {
-    const child = spawn(opencodeBin(), ["session", "delete", sessionId], {
+    const launcher = opencodeCommand();
+    const child = spawn(launcher.command, [...launcher.args, "session", "delete", sessionId], {
       stdio: "ignore",
       env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
       timeout: SESSION_DELETE_TIMEOUT_MS,
@@ -2018,7 +2076,8 @@ export async function runOpenCodeTurn(params: {
     timedOut: false,
   };
 
-  const child = spawn(opencodeBin(), args, {
+  const launcher = opencodeCommand();
+  const child = spawn(launcher.command, [...launcher.args, ...args], {
     stdio: ["pipe", "pipe", "pipe"],
     ...(cwd ? { cwd } : {}),
     env: {
@@ -2509,7 +2568,8 @@ export function streamOpenCode(
       // The timeout is unconditional: a turn is always bounded, even when
       // Pi supplies no timeoutMs (#73).
       const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
-      const bin = opencodeBin();
+      const launcher = opencodeCommand();
+      const bin = launcher.command;
       let turn: { code: number | null; state: OpenCodeTurnState } | undefined;
       if (dialect === "v1" && streamingEnabled() && serverUnavailableFor !== bin) {
         // OpenCode v2's server speaks a different API, so only v1 streams.
@@ -2539,7 +2599,7 @@ export function streamOpenCode(
         let serverStarted = false;
         try {
           turn = await withOpenCodeServer(
-            bin,
+            launcher,
             { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
             (server) => {
               serverStarted = true;

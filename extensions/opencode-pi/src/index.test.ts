@@ -42,6 +42,7 @@ import opencodePiExtension, {
   parseVerboseModels,
   reasoningCliArgs,
   resolveOpencodeBinary,
+  resolveOpencodeCommand,
   resolveTurnSystemPrompt,
   resolveTurnTimeoutMs,
   resolveTurnTools,
@@ -3111,6 +3112,93 @@ test("resolveOpencodeBinary falls back when the shim names a missing executable"
     const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".CMD" }, "win32");
 
     assert.equal(bin, "opencode");
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
+});
+
+// A cmd-shim whose bin is a JavaScript file launches Node with the script, so a
+// single executable path cannot express it: the resolver has to return the
+// command plus the script argument.
+test("resolveOpencodeCommand runs a shim that launches a JavaScript entrypoint", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-js-shim-"));
+  const shim = join(prefix, "opencode.cmd");
+  const nodeExe = join(prefix, "node.exe");
+  const script = join(prefix, "node_modules", "@opencode", "cli", "bin", "opencode.js");
+  try {
+    mkdirSync(dirname(script), { recursive: true });
+    writeFileSync(script, "");
+    writeFileSync(nodeExe, "");
+    writeFileSync(
+      shim,
+      [
+        "@ECHO OFF",
+        "SETLOCAL",
+        'SET "NODE_EXE=%~dp0\\node.exe"',
+        'IF NOT EXIST "%NODE_EXE%" (',
+        '  SET "NODE_EXE=node"',
+        ")",
+        'SET "CLI_JS=%~dp0\\node_modules\\@opencode\\cli\\bin\\opencode.js"',
+        '"%NODE_EXE%" "%CLI_JS%" %*',
+        "",
+      ].join("\r\n"),
+    );
+
+    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".CMD" }, "win32"), {
+      command: nodeExe,
+      args: [script],
+    });
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
+});
+
+// The legacy cmd-shim shape mentions `node.exe` in an IF EXIST guard before the
+// line that actually runs the target. Reading the guard would hand Node's path to
+// `spawn()` and start the wrong program.
+test("resolveOpencodeCommand ignores a helper executable outside the invocation line", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-helper-shim-"));
+  const shim = join(prefix, "opencode.cmd");
+  const nodeExe = join(prefix, "node.exe");
+  const target = join(prefix, "node_modules", "@opencode", "cli", "bin", "opencode.exe");
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "");
+    writeFileSync(nodeExe, "");
+    writeFileSync(
+      shim,
+      [
+        "@ECHO OFF",
+        'IF EXIST "%~dp0\\node.exe" (',
+        '  SET "_prog=%~dp0\\node.exe"',
+        ")",
+        '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe" %*',
+        "",
+      ].join("\r\n"),
+    );
+
+    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".CMD" }, "win32"), {
+      command: target,
+      args: [],
+    });
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
+});
+
+test("resolveOpencodeCommand falls back when a shim names a script that is missing", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-missing-script-"));
+  const shim = join(prefix, "opencode.cmd");
+  try {
+    writeFileSync(
+      shim,
+      '"%dp0%\\node.exe" "%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.js" %*\r\n',
+    );
+
+    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".CMD" }, "win32"), {
+      command: "opencode",
+      args: [],
+    });
   } finally {
     rmSync(prefix, { recursive: true, force: true });
   }
