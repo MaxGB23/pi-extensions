@@ -115,6 +115,7 @@ This queries OpenCode for model metadata (`opencode api GET /api/model` on OpenC
 | `OPENCODE_PI_BIN`    | Path to the OpenCode executable. Defaults to `opencode`, resolved through `PATH` without a shell: on Windows an npm-installed OpenCode leaves only an `opencode.cmd` / `opencode.ps1` shim there, which cannot be spawned, and a custom install outside `PATH` is never found, so point this at the real `opencode.exe`. |
 | `OPENCODE_PI_MODELS` | Comma- or space-separated model list to register. Values without `/` are prefixed with `opencode/`. Registers immediately with conservative fallback metadata (skipping discovery so startup never pays a discovery timeout); run `/opencode-pi update` to enrich these models with real capabilities and cost from discovery. |
 | `OPENCODE_PI_STREAM` | Set to `0` to run turns through `opencode run` instead of streaming them through `opencode serve`. Applies to both CLI dialects. |
+| `OPENCODE_PI_TOOL_RESCUES` | Corrective prompts sent inside the same OpenCode session when a model keeps reaching for OpenCode's disabled native tools, before the turn is interrupted. Defaults to `2`; `0` restores the fail-fast behaviour that interrupted the turn at the first ask past the cap. |
 
 To find the real executable behind an npm-managed install:
 
@@ -155,7 +156,7 @@ A continuation restarts as a fresh full-transcript session whenever the model, t
 - The bridge rejects OpenCode permission asks itself, exactly as a non-interactive `opencode run` does. On OpenCode v2 the rejection carries the bridge instruction, because a bare reject aborts the execution; with a message, v2 records the refusal and starts a new step that answers with markers instead.
 - If `opencode serve` cannot start, or (on v2) its event stream closes before it connects, the turn (and later turns for that binary) falls back to `opencode run`. Set `OPENCODE_PI_STREAM=0` to always use `opencode run`.
 
-OpenCode v2's server speaks a different API, so v2 has its own wire behind the same sink: the session is created with the bridge agent and the project directory in the body (v2 ignores `?directory=` at creation), events come from `/api/event`, and the turn ends on `session.execution.succeeded`, `failed` or `interrupted`. A native tool that actually ran, a failed execution or an interrupt fails the turn with the server's reason; three permission asks are answered and the fourth interrupts the turn instead of looping.
+OpenCode v2's server speaks a different API, so v2 has its own wire behind the same sink: the session is created with the bridge agent and the project directory in the body (v2 ignores `?directory=` at creation), events come from `/api/event`, and the turn ends on `session.execution.succeeded`, `failed` or `interrupted`. A native tool that actually ran, a failed execution or an interrupt fails the turn with the server's reason; three permission asks are answered with the bridge instruction, and past the cap the bridge sends a corrective prompt inside the same session instead of interrupting (see `OPENCODE_PI_TOOL_RESCUES`).
 
 The v1 bridge directories also disable OpenCode's `title` agent: OpenCode would otherwise spend a second request on the same model to title each new session, and on the free tier that request shares the rate limit with the turn.
 
