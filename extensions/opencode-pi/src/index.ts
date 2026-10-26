@@ -1132,6 +1132,18 @@ ${conversation.map(serializeMessage).join("\n\n---\n\n")}`);
 
 const MARKER_OPEN = "<pi_tool_call>";
 
+/**
+ * Visible diagnostics for text the bridge had to drop.
+ *
+ * Dropping a marker payload is necessary — raw marker bytes must never reach
+ * the chat — but dropping it *silently* turns a malformed reply into a reply
+ * that appears to stop mid-sentence. Every drop explains itself.
+ */
+const UNCLOSED_MARKER_NOTE =
+  "[opencode-pi] the reply stopped inside an unfinished tool-call block, so the text after it was not shown.";
+const DROPPED_MARKER_NOTE =
+  "[opencode-pi] a tool-call block could not be parsed and was removed from this reply.";
+
 // Detects marker syntax anywhere in the response, not just at the start, so
 // prose-then-marker and marker-then-prose responses are treated the same
 // way: either both are rejected as malformed tool-call attempts, or neither
@@ -1326,9 +1338,9 @@ export type MarkerStreamFilter = {
 /**
  * Text is released as soon as it cannot start a `<pi_tool_call>` marker. A
  * marker is held until its closing tag arrives and is then skipped, and an
- * unclosed marker holds everything after it until the reply ends, so raw
- * markers never stream into Pi. A reply that opens with a quote may be a
- * JSON-quoted marker response, so it is held whole.
+ * unclosed marker holds everything after it until the reply ends, where it is
+ * replaced by a visible note instead of vanishing. A reply that opens with a
+ * quote may be a JSON-quoted marker response, so it is held whole.
  */
 export function createMarkerStreamFilter(): MarkerStreamFilter {
   let text = "";
@@ -1374,7 +1386,7 @@ export function createMarkerStreamFilter(): MarkerStreamFilter {
     finish(displayText: string): string {
       if (quoted) return displayText;
       const rest = text.slice(released);
-      return rest.startsWith(MARKER_OPEN) ? "" : rest;
+      return rest.startsWith(MARKER_OPEN) ? UNCLOSED_MARKER_NOTE : rest;
     },
   };
 }
@@ -1391,6 +1403,7 @@ export function parseToolCallResponse(
 
   const parsed: ParsedToolCall[] = [];
   const strippedSpans: MarkerSpan[] = [...extraction.invalidSpans];
+  let droppedPayload = false;
   let payloadRejection:
     | { reason: "invalid_payload" }
     | undefined;
@@ -1410,6 +1423,7 @@ export function parseToolCallResponse(
       // Skip the invalid body but keep any valid sibling calls; if no
       // call survives, surface the original corrective diagnostic.
       payloadRejection ??= { reason: "invalid_payload" };
+      droppedPayload = true;
       strippedSpans.push({ start: marker.start, end: marker.end });
       continue;
     }
@@ -1433,10 +1447,13 @@ export function parseToolCallResponse(
   }
 
   if (strippedSpans.length === 0) return { ok: true, calls: parsed };
+  const cleaned = stripMarkerSpans(normalizedText, strippedSpans);
   return {
     ok: true,
     calls: parsed,
-    cleanedText: stripMarkerSpans(normalizedText, strippedSpans),
+    cleanedText: droppedPayload
+      ? [cleaned.trim(), DROPPED_MARKER_NOTE].filter(Boolean).join("\n\n")
+      : cleaned,
   };
 }
 

@@ -692,6 +692,44 @@ test("a continued v2 turn prompts the recorded session and creates no new one", 
   );
 });
 
+// S6: the reply used to be cut where an unclosed marker began, and the tail
+// was dropped with no trace. Prose before the marker is already released, so
+// the only honest ending is a visible note saying the rest was not shown.
+test("an unfinished tool-call block ends the reply with a visible note", () => {
+  const filter = createMarkerStreamFilter();
+
+  assert.equal(filter.push("El texto visible sigue completo."), "El texto visible sigue completo.");
+  filter.push('<pi_tool_call>{"name":"read","argu');
+  const tail = filter.finish("");
+
+  assert.match(tail, /unfinished tool-call block/, "the drop is explained, not silent");
+  assert.ok(
+    !tail.includes("<pi_tool_call>"),
+    "the note never leaks the raw marker",
+  );
+});
+
+// S6: a reply that carries one valid call and one unparseable block keeps the
+// call, but the removed block is reported instead of vanishing.
+test("an unparseable tool-call block is reported instead of silently removed", () => {
+  const allowed = new Set(["read"]);
+  const text = [
+    '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>',
+    '<pi_tool_call>{"name": broken</pi_tool_call>',
+  ].join("\n");
+
+  const parsed = parseToolCallResponse(text, allowed);
+
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.calls, [{ name: "read", arguments: { path: "README.md" } }]);
+  assert.match(
+    parsed.cleanedText ?? "",
+    /could not be parsed/,
+    "the reply says a block was removed instead of ending mid-sentence",
+  );
+});
+
 test("a v2 permission ask is rejected with the marker instruction and the turn survives", async () => {
   const model = bridgeModel();
   const output = emptyOutput(model);
