@@ -27,6 +27,7 @@ import {
   serverRequest,
   subscribeEvents,
   withOpenCodeServer,
+  EventStreamClosedBeforeConnect,
   type OpenCodeServer,
   type ServerEvent,
 } from "./server.js";
@@ -1256,6 +1257,18 @@ ${conversation.map(serializeMessage).join("\n\n---\n\n")}`);
 
 const MARKER_OPEN = "<pi_tool_call>";
 
+/**
+ * Visible diagnostics for text the bridge had to drop.
+ *
+ * Dropping a marker payload is necessary — raw marker bytes must never reach
+ * the chat — but dropping it *silently* turns a malformed reply into a reply
+ * that appears to stop mid-sentence. Every drop explains itself.
+ */
+const UNCLOSED_MARKER_NOTE =
+  "[opencode-pi] the reply stopped inside an unfinished tool-call block, so the text after it was not shown.";
+const DROPPED_MARKER_NOTE =
+  "[opencode-pi] a tool-call block could not be parsed and was removed from this reply.";
+
 // Detects marker syntax anywhere in the response, not just at the start, so
 // prose-then-marker and marker-then-prose responses are treated the same
 // way: either both are rejected as malformed tool-call attempts, or neither
@@ -1450,9 +1463,9 @@ export type MarkerStreamFilter = {
 /**
  * Text is released as soon as it cannot start a `<pi_tool_call>` marker. A
  * marker is held until its closing tag arrives and is then skipped, and an
- * unclosed marker holds everything after it until the reply ends, so raw
- * markers never stream into Pi. A reply that opens with a quote may be a
- * JSON-quoted marker response, so it is held whole.
+ * unclosed marker holds everything after it until the reply ends, where it is
+ * replaced by a visible note instead of vanishing. A reply that opens with a
+ * quote may be a JSON-quoted marker response, so it is held whole.
  */
 export function createMarkerStreamFilter(): MarkerStreamFilter {
   let text = "";
@@ -1498,7 +1511,7 @@ export function createMarkerStreamFilter(): MarkerStreamFilter {
     finish(displayText: string): string {
       if (quoted) return displayText;
       const rest = text.slice(released);
-      return rest.startsWith(MARKER_OPEN) ? "" : rest;
+      return rest.startsWith(MARKER_OPEN) ? UNCLOSED_MARKER_NOTE : rest;
     },
   };
 }
@@ -1515,6 +1528,7 @@ export function parseToolCallResponse(
 
   const parsed: ParsedToolCall[] = [];
   const strippedSpans: MarkerSpan[] = [...extraction.invalidSpans];
+  let droppedPayload = false;
   let payloadRejection:
     | { reason: "invalid_payload" }
     | undefined;
@@ -1534,6 +1548,7 @@ export function parseToolCallResponse(
       // Skip the invalid body but keep any valid sibling calls; if no
       // call survives, surface the original corrective diagnostic.
       payloadRejection ??= { reason: "invalid_payload" };
+      droppedPayload = true;
       strippedSpans.push({ start: marker.start, end: marker.end });
       continue;
     }
@@ -1557,10 +1572,13 @@ export function parseToolCallResponse(
   }
 
   if (strippedSpans.length === 0) return { ok: true, calls: parsed };
+  const cleaned = stripMarkerSpans(normalizedText, strippedSpans);
   return {
     ok: true,
     calls: parsed,
-    cleanedText: stripMarkerSpans(normalizedText, strippedSpans),
+    cleanedText: droppedPayload
+      ? [cleaned.trim(), DROPPED_MARKER_NOTE].filter(Boolean).join("\n\n")
+      : cleaned,
   };
 }
 
@@ -1925,6 +1943,47 @@ const AGENT_BODY = `You are the OpenCode side of a Pi Coding Agent bridge. OpenC
 `;
 
 /**
+ * Answer sent for a v2 permission ask. A bare reject yields
+ * `error.type: "aborted"` and kills the execution, so the rejection carries the
+ * bridge instruction: with a message, v2 records `permission.rejected` and
+ * starts a new step by itself (measured on v2.1.2, D4).
+ */
+const V2_PERMISSION_REJECTION_MESSAGE =
+  'OpenCode native tools are disabled in this bridge. Do not ask for permission or call a native tool. Reply with plain text, or with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> when a Pi tool is needed.';
+
+/** Consecutive permission asks answered before the turn is interrupted. */
+const V2_PERMISSION_ASK_LIMIT = 3;
+
+/**
+ * Corrective prompts sent inside the same OpenCode session before the turn is
+ * interrupted for a native tool the bridge disabled.
+ *
+ * The three rejected asks are soft nudges: v2 records the rejection and starts
+ * a new step by itself, so a model that listens recovers without help. This
+ * budget is the hard nudge for a model that ignores all three, and it exists so
+ * that a format slip never costs the whole turn while it lasts.
+ *
+ * `OPENCODE_PI_TOOL_RESCUES=0` restores the interrupt-at-the-cap behaviour.
+ * Same name and default as the CLI corrective retry, so the two paths cannot
+ * drift apart.
+ */
+function nativeToolRescues(): number {
+  const raw = Number(process.env.OPENCODE_PI_TOOL_RESCUES ?? 2);
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : 0;
+}
+
+/** Correction sent inside the same session after a native tool slipped through. */
+function buildNativeToolCorrection(tool: string): string {
+  const named = tool ? `the native "${tool}" tool` : "a native OpenCode tool";
+  return [
+    `You invoked ${named}, which is disabled in this session: nothing from that call reaches Pi.`,
+    `If Pi must run a tool, reply with only one or more tool-call blocks separated by whitespace:`,
+    `<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>`,
+    `Use only exact tool names from the tool list you were given. If you can answer without a tool, answer in plain text.`,
+  ].join("\n");
+}
+
+/**
  * Agent definition for OpenCode v1, which uses the legacy `permission` map
  * and the v1 action names (`bash`, `task`).
  *
@@ -2002,6 +2061,21 @@ function isRefusedTool(toolState: { status?: string; error?: unknown } | undefin
   const text = typeof error === "object" && error !== null ? error.message : error;
   return OPENCODE_PERMISSION_REJECTION.test(String(text ?? ""));
 }
+
+/**
+ * Whether a v2 tool failure is OpenCode refusing the tool before it ran. v2
+ * carries the reason in `error.type` (`permission.rejected` when the ask was
+ * answered with a message, `aborted` when it was not), and the v1 anchors still
+ * appear in `error.message`.
+ */
+function isV2RefusedTool(
+  error: { type?: unknown; message?: unknown } | undefined,
+): boolean {
+  const type = typeof error?.type === "string" ? error.type : "";
+  if (/^(permission\.rejected|aborted)$/i.test(type)) return true;
+  return OPENCODE_PERMISSION_REJECTION.test(String(error?.message ?? ""));
+}
+
 
 async function createTempAgentDir(dialect: CliDialect): Promise<string> {
   // realpath keeps PWD and the spawn cwd identical where tmpdir is a symlink
@@ -2217,6 +2291,143 @@ export type OpenCodeStreamSink = {
   thinking(partId: string, delta: string): void;
 };
 
+export type V2ServerEvent = { type: string; data?: Record<string, unknown> };
+
+/**
+ * Translate OpenCode v2 server events into the same sink the v1 turn uses, so
+ * both dialects share one marker filter and one content-block builder.
+ *
+ * v2 names its parts by `assistantMessageID` plus `ordinal` instead of a part
+ * id, and it closes a turn on `session.execution.*` rather than on
+ * `session.idle`. A closing `session.text.ended` repeats the full text, so only
+ * the part that no delta delivered yet is appended.
+ */
+export function createV2EventMapper(params: {
+  state: OpenCodeTurnState;
+  sink: OpenCodeStreamSink;
+  /** Agent the session must run with; a mismatch fails the turn. */
+  agent?: string;
+  model?: Model<Api>;
+  output?: AssistantMessage;
+}): { handle(event: V2ServerEvent): boolean } {
+  const { state, sink } = params;
+  const delivered = new Map<string, string>();
+  const partId = (data: Record<string, unknown>): string =>
+    `${String(data.assistantMessageID ?? "message")}:${String(data.ordinal ?? 0)}`;
+  const append = (kind: "text" | "thinking", id: string, delta: string): void => {
+    if (!delta) return;
+    delivered.set(id, (delivered.get(id) ?? "") + delta);
+    if (kind === "text") {
+      state.text += delta;
+      sink.text(id, delta);
+    } else {
+      state.thinking += delta;
+      sink.thinking(id, delta);
+    }
+  };
+
+  return {
+    handle(event: V2ServerEvent): boolean {
+      const data = event.data ?? {};
+      if (
+        state.sessionId &&
+        typeof data.sessionID === "string" &&
+        data.sessionID !== state.sessionId
+      ) {
+        return false;
+      }
+      if (event.type === "session.text.delta" || event.type === "session.reasoning.delta") {
+        const kind = event.type === "session.text.delta" ? "text" : "thinking";
+        if (typeof data.delta === "string") append(kind, partId(data), data.delta);
+        return false;
+      }
+      if (event.type === "session.text.ended" || event.type === "session.reasoning.ended") {
+        const kind = event.type === "session.text.ended" ? "text" : "thinking";
+        const id = partId(data);
+        const full =
+          typeof data.text === "string"
+            ? data.text
+            : typeof data.reasoning === "string"
+              ? data.reasoning
+              : "";
+        const seen = delivered.get(id) ?? "";
+        // Providers that stream a single delta already delivered everything.
+        if (full.startsWith(seen)) append(kind, id, full.slice(seen.length));
+        return false;
+      }
+      if (event.type === "session.step.started") {
+        // Omitting `agent` when the session is created silently runs the
+        // user's default agent, so a mismatch fails the turn instead of
+        // quietly running without the bridge's instructions.
+        const actual = typeof data.agent === "string" ? data.agent : undefined;
+        if (params.agent && actual && actual !== params.agent) {
+          state.error = `OpenCode ran the turn with agent ${JSON.stringify(actual)} instead of ${JSON.stringify(params.agent)}`;
+          state.stderr = (state.stderr + `\n${state.error}`).slice(-STDERR_LIMIT);
+          return true;
+        }
+        return false;
+      }
+      if (event.type === "session.step.ended") {
+        const finish = String(data.finish ?? data.rawFinish ?? "");
+        if (/length|max.?tokens/i.test(finish)) state.finishReason = "length";
+        const tokens = data.tokens as
+          | {
+              input?: number;
+              output?: number;
+              reasoning?: number;
+              total?: number;
+              cache?: { read?: number; write?: number };
+            }
+          | undefined;
+        if (tokens && params.model && params.output) {
+          const usage = params.output.usage;
+          usage.input = Number(tokens.input ?? 0);
+          usage.output = Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
+          usage.cacheRead = Number(tokens.cache?.read ?? 0);
+          usage.cacheWrite = Number(tokens.cache?.write ?? 0);
+          usage.totalTokens = Number(
+            tokens.total ??
+              usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+          );
+          calculateCost(params.model, usage);
+        }
+        return false;
+      }
+      if (event.type === "session.tool.success" || event.type === "session.tool.failed") {
+        // D1: `session.tool.called` fires before the permission decision, so it
+        // proves nothing. A refused tool changed nothing; one that ran fails the
+        // turn on the v1 path by setting `toolUse`, and v2 does the same.
+        const error = data.error as { type?: unknown; message?: unknown } | undefined;
+        const refused = event.type === "session.tool.failed" && isV2RefusedTool(error);
+        if (!refused) {
+          state.toolUse = typeof data.name === "string" && data.name ? data.name : "unknown";
+        }
+        return false;
+      }
+      if (event.type === "session.execution.failed") {
+        // A failure with no text is worse than useless: it looks like a
+        // successful empty turn. v2 carries the reason on the event.
+        const error = data.error as { message?: string; type?: string } | undefined;
+        const message =
+          typeof error?.message === "string" && error.message.trim()
+            ? error.message.trim()
+            : typeof error?.type === "string" && error.type.trim()
+              ? `OpenCode execution failed: ${error.type}`
+              : "OpenCode execution failed";
+        state.error = message;
+        state.stderr = (state.stderr + `\n${message}`).slice(-STDERR_LIMIT);
+        return true;
+      }
+      if (event.type === "session.execution.interrupted") {
+        state.error = "OpenCode interrupted the turn";
+        state.stderr = (state.stderr + `\n${state.error}`).slice(-STDERR_LIMIT);
+        return true;
+      }
+      return event.type === "session.execution.succeeded";
+    },
+  };
+}
+
 /**
  * Run one turn on the shared `opencode serve` (OpenCode v1) and pass text and
  * reasoning deltas to `sink` while the model writes them. `opencode run` only
@@ -2411,6 +2622,221 @@ export async function runOpenCodeServerTurn(params: {
 // straight to `opencode run` instead of waiting on the server again.
 let serverUnavailableFor: string | undefined;
 
+/**
+ * Body for `POST /api/session` on OpenCode v2. The agent must be explicit:
+ * an omitted agent silently runs the user's default agent, and the bridge's
+ * instructions never load. v2 names the model `{providerID, id}` (v1 used
+ * `modelID`), and a `#variant` suffix on Pi's model id becomes `variant`.
+ */
+export function v2SessionBody(
+  model: Pick<Model<Api>, "id">,
+  variant?: string,
+  directory?: string,
+): Record<string, unknown> {
+  const hash = model.id.indexOf("#");
+  const base = hash >= 0 ? model.id.slice(0, hash) : model.id;
+  const inlineVariant = hash >= 0 ? model.id.slice(hash + 1) : undefined;
+  const slash = base.indexOf("/");
+  const ref =
+    slash > 0
+      ? { providerID: base.slice(0, slash), id: base.slice(slash + 1) }
+      : { providerID: "opencode", id: base };
+  const chosen = variant?.trim() || inlineVariant?.trim();
+  return {
+    agent: AGENT_ID,
+    model: chosen ? { ...ref, variant: chosen } : ref,
+    // v2 ignores the `?directory=` query when it creates a session: the
+    // project comes from the server's cwd unless the body names it.
+    ...(directory ? { location: { directory } } : {}),
+  };
+}
+
+/** Body for `POST /api/session/{id}/prompt` on OpenCode v2. */
+export function v2PromptBody(
+  text: string,
+  files: Array<{ uri: string; name?: string }> = [],
+): Record<string, unknown> {
+  return files.length > 0 ? { text, files } : { text };
+}
+
+/**
+ * Run one turn on the shared `opencode serve` (OpenCode v2) and pass text and
+ * reasoning deltas to `sink` through {@link createV2EventMapper}.
+ *
+ * Same result shape as {@link runOpenCodeServerTurn}: `code` is 0 once the
+ * execution finishes and null when the turn was aborted or timed out.
+ */
+export async function runV2ServerTurn(params: {
+  server: OpenCodeServer;
+  directory: string;
+  /** Recorded session to continue; a new session is created otherwise. */
+  sessionId?: string;
+  prompt: string;
+  files?: Array<{ uri: string; name?: string }>;
+  variant?: string;
+  signal?: AbortSignal;
+  timeoutMs: number;
+  model: Model<Api>;
+  output: AssistantMessage;
+  sink: OpenCodeStreamSink;
+  onSessionId?: (sessionId: string) => void;
+}): Promise<{ code: number | null; state: OpenCodeTurnState }> {
+  const { server, directory, prompt, files, signal, timeoutMs, model, output, sink } =
+    params;
+  const state: OpenCodeTurnState = {
+    text: "",
+    thinking: "",
+    stderr: "",
+    finishReason: "stop",
+    timedOut: false,
+  };
+
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  if (signal?.aborted) controller.abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  const timer = setTimeout(() => {
+    state.timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  const request = (method: string, path: string, payload?: unknown) =>
+    serverRequest(server, method, path, directory, payload, controller.signal);
+  const mapper = createV2EventMapper({
+    state,
+    sink,
+    agent: AGENT_ID,
+    model,
+    output,
+  });
+
+  let finished = false;
+  let asks = 0;
+  let totalAsks = 0;
+  let rescues = nativeToolRescues();
+  let events: AsyncGenerator<ServerEvent>;
+  try {
+    // Subscribe first so no event published for the prompt is missed. This
+    // throws EventStreamClosedBeforeConnect when the stream ends before
+    // `server.connected`, which the caller turns into the `opencode run`
+    // fallback.
+    events = await subscribeEvents(
+      server,
+      directory,
+      controller.signal,
+      "/api/event",
+    );
+    try {
+      let sessionId = params.sessionId;
+      if (!sessionId) {
+        const created = await request(
+          "POST",
+          "/api/session",
+          v2SessionBody(model, params.variant, directory),
+        );
+        sessionId = created?.data?.id ?? created?.id;
+        if (typeof sessionId !== "string" || !sessionId) {
+          throw new Error("OpenCode did not return a session ID");
+        }
+      }
+      state.sessionId = sessionId;
+      params.onSessionId?.(sessionId);
+      await request(
+        "POST",
+        `/api/session/${sessionId}/prompt`,
+        v2PromptBody(prompt, files),
+      );
+      for await (const event of events) {
+        const v2 = event as V2ServerEvent;
+        if (v2.type === "permission.asked") {
+          // D4: reject with the bridge instruction, never with a bare reject.
+          const data = v2.data ?? {};
+          if (
+            state.sessionId &&
+            typeof data.sessionID === "string" &&
+            data.sessionID !== state.sessionId
+          ) {
+            continue;
+          }
+          asks += 1;
+          if (asks > V2_PERMISSION_ASK_LIMIT) {
+            // Answered asks are soft nudges; past the cap the model gets one
+            // explicit corrective prompt inside the same session, and the turn
+            // is interrupted only when that budget is spent too.
+            totalAsks += asks;
+            const canRescue = rescues > 0 && Boolean(state.sessionId);
+            if (!canRescue) {
+              // A model that keeps asking would loop forever: stop the turn the
+              // same way the v1 path does, with an error naming the count.
+              state.error = `OpenCode asked for native tools ${totalAsks} times; this bridge only accepts marker tool calls, so the turn was interrupted.`;
+              state.stderr = (state.stderr + `\n${state.error}`).slice(-STDERR_LIMIT);
+              await request(
+                "POST",
+                `/api/session/${state.sessionId}/interrupt`,
+              ).catch(() => undefined);
+              finished = true;
+              break;
+            }
+            rescues -= 1;
+            asks = 0;
+            // Reject the ask first so the session has no pending permission
+            // when the correction arrives, then restate the protocol.
+            await request(
+              "POST",
+              `/api/session/${state.sessionId}/permission/${String(data.id)}/reply`,
+              { decision: "reject", message: V2_PERMISSION_REJECTION_MESSAGE },
+            ).catch(() => undefined);
+            await request(
+              "POST",
+              `/api/session/${state.sessionId}/prompt`,
+              v2PromptBody(
+                buildNativeToolCorrection(
+                  typeof data.action === "string" ? data.action : "",
+                ),
+              ),
+            ).catch(() => undefined);
+            continue;
+          }
+          await request(
+            "POST",
+            `/api/session/${state.sessionId}/permission/${String(data.id)}/reply`,
+            { decision: "reject", message: V2_PERMISSION_REJECTION_MESSAGE },
+          ).catch(() => undefined);
+          continue;
+        }
+        if (mapper.handle(v2)) {
+          finished = true;
+          break;
+        }
+      }
+    } finally {
+      await events.return(undefined).catch(() => undefined);
+    }
+    if (!finished) {
+      // The stream connected and then ended without a terminal event: the
+      // turn is incomplete, and it is not the "server never came up" case
+      // that falls back to `opencode run`.
+      throw new Error("OpenCode event stream ended before the turn finished");
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) throw error;
+    if (state.sessionId) {
+      await serverRequest(
+        server,
+        "POST",
+        `/api/session/${state.sessionId}/interrupt`,
+        directory,
+        undefined,
+        AbortSignal.timeout(SESSION_DELETE_TIMEOUT_MS),
+      ).catch(() => undefined);
+    }
+  } finally {
+    signal?.removeEventListener("abort", abort);
+    clearTimeout(timer);
+  }
+
+  return { code: finished ? 0 : null, state };
+}
+
 export function streamOpenCode(
   model: Model<Api>,
   context: Context,
@@ -2574,31 +3000,38 @@ export function streamOpenCode(
       const launcher = opencodeCommand();
       const bin = launcher.command;
       let turn: { code: number | null; state: OpenCodeTurnState } | undefined;
-      if (dialect === "v1" && streamingEnabled() && serverUnavailableFor !== bin) {
-        // OpenCode v2's server speaks a different API, so only v1 streams.
+      // Both dialects stream through `opencode serve`; only the wire differs.
+      if (streamingEnabled() && serverUnavailableFor !== bin) {
         const serverVariant = requestedReasoning && requestedReasoning !== "off"
           ? model.thinkingLevelMap?.[requestedReasoning]
           : undefined;
+        const chosenVariant =
+          typeof serverVariant === "string" && serverVariant.trim()
+            ? serverVariant
+            : undefined;
         const slash = model.id.indexOf("/");
-        const body = {
-          agent: AGENT_ID,
-          model: slash > 0
-            ? { providerID: model.id.slice(0, slash), modelID: model.id.slice(slash + 1) }
-            : { providerID: "opencode", modelID: model.id },
-          ...(typeof serverVariant === "string" && serverVariant.trim()
-            ? { variant: serverVariant }
-            : {}),
-          // The same file parts `opencode run --file` sends.
-          parts: [
-            ...imagePaths.map((path, index) => ({
-              type: "file",
-              mime: images[index]!.mimeType,
-              filename: basename(path),
-              url: pathToFileURL(path).href,
-            })),
-            { type: "text", text: prompt },
-          ],
-        };
+        const body = dialect === "v2"
+          ? undefined
+          : {
+              agent: AGENT_ID,
+              model: slash > 0
+                ? { providerID: model.id.slice(0, slash), modelID: model.id.slice(slash + 1) }
+                : { providerID: "opencode", modelID: model.id },
+              ...(chosenVariant ? { variant: chosenVariant } : {}),
+              // The same file parts `opencode run --file` sends.
+              parts: [
+                ...imagePaths.map((path, index) => ({
+                  type: "file",
+                  mime: images[index]!.mimeType,
+                  filename: basename(path),
+                  url: pathToFileURL(path).href,
+                })),
+                { type: "text", text: prompt },
+              ],
+            };
+        const serverSessionId = isContinuation
+          ? piState?.opencodeSessionId
+          : undefined;
         let serverStarted = false;
         try {
           turn = await withOpenCodeServer(
@@ -2607,10 +3040,32 @@ export function streamOpenCode(
             (server) => {
               serverStarted = true;
               streamed = true;
+              if (dialect === "v2") {
+                return runV2ServerTurn({
+                  server,
+                  directory: sessionDir,
+                  sessionId: serverSessionId,
+                  prompt,
+                  // The same files `opencode run --file` sends.
+                  files: imagePaths.map((path) => ({
+                    uri: pathToFileURL(path).href,
+                    name: basename(path),
+                  })),
+                  variant: chosenVariant,
+                  signal: options?.signal,
+                  timeoutMs: turnTimeoutMs,
+                  model,
+                  output,
+                  sink,
+                  onSessionId: (id) => {
+                    capturedSessionId = id;
+                  },
+                });
+              }
               return runOpenCodeServerTurn({
                 server,
                 directory: sessionDir,
-                sessionId: isContinuation ? piState?.opencodeSessionId : undefined,
+                sessionId: serverSessionId,
                 body,
                 signal: options?.signal,
                 timeoutMs: turnTimeoutMs,
@@ -2622,12 +3077,36 @@ export function streamOpenCode(
                 },
               });
             },
+            // `--pure` exists only in v1; on v2 it would drop the config,
+            // plugins and MCP servers the CLI path inherits.
+            { pure: dialect === "v1" },
           );
         } catch (error) {
-          if (serverStarted || options?.signal?.aborted) throw error;
-          // `opencode serve` did not start, so this CLI runs every turn
-          // through `opencode run` instead.
+          const v2StreamClosed =
+            dialect === "v2" && error instanceof EventStreamClosedBeforeConnect;
+          if ((serverStarted && !v2StreamClosed) || options?.signal?.aborted) {
+            throw error;
+          }
+          // `opencode serve` did not start, or (v2) its event stream closed
+          // before `server.connected`; this CLI runs every turn through
+          // `opencode run` instead. Nothing the server produced is used from
+          // here on, so the finalizer must read the `opencode run` reply: with
+          // `streamed` still set, the fallback's text was dropped and the turn
+          // failed as an empty response.
+          streamed = false;
           serverUnavailableFor = bin;
+          if (dialect === "v2") {
+            // One notice: the turn still answers, but without streaming.
+            const ui = (context as {
+              ui?: { notify?: (msg: string, level: string) => void };
+            }).ui;
+            if (ui?.notify) {
+              ui.notify(
+                "opencode-pi: the OpenCode v2 server did not stream this turn; it ran through `opencode run` instead.",
+                "warning",
+              );
+            }
+          }
         }
       }
       turn ??= await runOpenCodeTurn({
