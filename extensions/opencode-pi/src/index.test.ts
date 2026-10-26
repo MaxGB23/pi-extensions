@@ -2977,6 +2977,47 @@ test("resolveOpencodeBinary prefers OPENCODE_PI_BIN and trims it", () => {
   );
 });
 
+test("resolveOpencodeBinary follows a configured batch shim instead of returning it", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-configured-shim-"));
+  const shim = join(prefix, "opencode.cmd");
+  const target = join(prefix, "node_modules", "@opencode", "cli", "bin", "opencode.exe");
+  try {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, "");
+    writeFileSync(
+      shim,
+      [
+        "@ECHO off",
+        "GOTO start",
+        ":find_dp0",
+        "SET dp0=%~dp0",
+        "EXIT /b",
+        ":start",
+        "SETLOCAL",
+        "CALL :find_dp0",
+        '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*',
+        "",
+      ].join("\r\n"),
+    );
+
+    assert.equal(resolveOpencodeBinary({ OPENCODE_PI_BIN: shim }, "win32"), target);
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
+});
+
+test("resolveOpencodeBinary keeps a configured shim it cannot follow", () => {
+  const prefix = mkdtempSync(join(tmpdir(), "opencode-pi-configured-broken-"));
+  const shim = join(prefix, "opencode.cmd");
+  try {
+    writeFileSync(shim, "@ECHO off\r\nnode something-else.js %*\r\n");
+
+    assert.equal(resolveOpencodeBinary({ OPENCODE_PI_BIN: shim }, "win32"), shim);
+  } finally {
+    rmSync(prefix, { recursive: true, force: true });
+  }
+});
+
 test("resolveOpencodeBinary returns the bare command off Windows", () => {
   assert.equal(resolveOpencodeBinary({ PATH: "/usr/local/bin" }, "linux", () => true), "opencode");
 });

@@ -263,12 +263,14 @@ async function writeModelCache(models: OpenCodeModelInfo[]): Promise<void> {
 /**
  * Resolve the OpenCode executable the way a shell would.
  *
- * `OPENCODE_PI_BIN` wins whenever it holds a value. Off Windows the bare
- * command is used, because a POSIX `PATH` lookup already works. On Windows the
- * command is looked up in `PATH` with each `PATHEXT` extension, and a `.cmd`
- * shim is followed to the executable it calls: `spawn()` cannot run a batch
- * file without a shell, and putting these arguments through a shell would add
- * quoting and injection surface for values such as the server password.
+ * `OPENCODE_PI_BIN` wins whenever it holds a value, and a value pointing at a
+ * `.cmd`/`.bat` shim is followed to the executable it calls for the same reason
+ * the `PATH` lookup below follows one. Off Windows the bare command is used,
+ * because a POSIX `PATH` lookup already works. On Windows the command is looked
+ * up in `PATH` with each `PATHEXT` extension, and a `.cmd` shim is followed to
+ * the executable it calls: `spawn()` cannot run a batch file without a shell,
+ * and putting these arguments through a shell would add quoting and injection
+ * surface for values such as the server password.
  */
 export function resolveOpencodeBinary(
   env: NodeJS.ProcessEnv = process.env,
@@ -276,7 +278,12 @@ export function resolveOpencodeBinary(
   exists: (path: string) => boolean = existsSync,
 ): string {
   const configured = env.OPENCODE_PI_BIN?.trim();
-  if (configured) return configured;
+  if (configured) {
+    if (platform === "win32" && /\.(cmd|bat)$/i.test(configured)) {
+      return shimTarget(configured, exists) ?? configured;
+    }
+    return configured;
+  }
   if (platform !== "win32") return "opencode";
   const pathValue = env.PATH ?? env.Path ?? "";
   const extensions = (env.PATHEXT?.trim() || ".COM;.EXE;.BAT;.CMD")
