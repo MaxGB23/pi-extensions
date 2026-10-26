@@ -25,6 +25,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import opencodePiExtension, {
   agentDefinition,
+  buildPrompt,
   cleanupPiSessionState,
   conversationMessages,
   deleteOpenCodeSession,
@@ -2292,6 +2293,18 @@ process.stdin.on("end", () => {
     await cleanupPiSessionState(piSessionId);
     rmSync(captureDir, { recursive: true, force: true });
   }
+});
+
+test("the bridge prompt says which tools are the model's own", () => {
+  const prompt = buildPrompt(userContext(["q1"], ["read", "bash"]));
+
+  assert.match(
+    prompt,
+    /Your own tool list contains only the read tool/,
+    "a weak model must not infer that the Pi tool names are its own",
+  );
+  assert.match(prompt, /exists only in Pi/);
+  assert.match(prompt, /Available Pi tools/);
 });
 
 test("streamOpenCode restarts the session when tools change", async () => {
