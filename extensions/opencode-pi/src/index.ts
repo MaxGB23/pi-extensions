@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -351,7 +351,10 @@ function shimCommand(
     const withVariables = value.replace(/%([^%]+)%/g, (whole, name: string) =>
       variables.get(name.toUpperCase()) ?? whole,
     );
-    return withVariables.replace(/%~?dp0%?/gi, shimDir);
+    // The shim is a batch file, so it always writes Windows separators, but the
+    // resolved paths are handed to the host's `spawn()` and `existsSync()`: use
+    // the host separator so the result is addressable on the machine running Pi.
+    return withVariables.replace(/%~?dp0%?/gi, shimDir).replace(/\\/g, sep);
   };
   const invocation = [...lines].reverse().find((line) => line.includes("%*"));
   if (!invocation) return undefined;
