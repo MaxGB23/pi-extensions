@@ -3084,7 +3084,7 @@ test("resolveOpencodeBinary follows an npm shim to the executable it calls", () 
       ].join("\r\n"),
     );
 
-    const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".CMD" }, "win32");
+    const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".cmd" }, "win32");
 
     assert.equal(bin, target);
     assert.equal(existsSync(bin), true);
@@ -3109,7 +3109,7 @@ test("resolveOpencodeBinary falls back when the shim names a missing executable"
       '"%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.exe"   %*\r\n',
     );
 
-    const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".CMD" }, "win32");
+    const bin = resolveOpencodeBinary({ PATH: prefix, PATHEXT: ".cmd" }, "win32");
 
     assert.equal(bin, "opencode");
   } finally {
@@ -3144,7 +3144,7 @@ test("resolveOpencodeCommand runs a shim that launches a JavaScript entrypoint",
       ].join("\r\n"),
     );
 
-    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".CMD" }, "win32"), {
+    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".cmd" }, "win32"), {
       command: nodeExe,
       args: [script],
     });
@@ -3177,7 +3177,7 @@ test("resolveOpencodeCommand ignores a helper executable outside the invocation 
       ].join("\r\n"),
     );
 
-    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".CMD" }, "win32"), {
+    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".cmd" }, "win32"), {
       command: target,
       args: [],
     });
@@ -3195,7 +3195,7 @@ test("resolveOpencodeCommand falls back when a shim names a script that is missi
       '"%dp0%\\node.exe" "%dp0%\\node_modules\\@opencode\\cli\\bin\\opencode.js" %*\r\n',
     );
 
-    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".CMD" }, "win32"), {
+    assert.deepEqual(resolveOpencodeCommand({ PATH: prefix, PATHEXT: ".cmd" }, "win32"), {
       command: "opencode",
       args: [],
     });
