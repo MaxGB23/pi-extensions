@@ -1207,7 +1207,7 @@ function serializeTools(tools?: Tool[]): string {
   );
 }
 
-function buildPrompt(context: Context): string {
+export function buildPrompt(context: Context): string {
   const sections: string[] = [];
   sections.push(`# Pi/OpenCode bridge instructions
 
@@ -1220,7 +1220,7 @@ If you need Pi to run a tool, your entire response must contain only one or more
 
 Rules for Pi tool calls:
 - Use only exact tool names listed in the "Available Pi tools" section.
-- A "read" tool may appear in your own tool list. It belongs to OpenCode, not to Pi, and it is disabled in this session. Never call it; ask Pi for the file instead.
+- Your own tool list contains only the read tool. It belongs to OpenCode, not to Pi, and calling it does nothing useful here. Every other name in the "Available Pi tools" section exists only in Pi: request it with a tool-call block, never call it directly. A native call to one of those names just costs an extra model request before you do it the right way.
 - The JSON inside every marker must be valid JSON with a string "name" and an object "arguments".
 - Escape every quote inside a JSON string value as \\\", especially quotes inside shell commands.
 - Markers are bridge control syntax. Never quote them, explain them, put them in prose, or wrap them in Markdown fences.
@@ -1936,8 +1936,9 @@ function buildContinuationPrompt(deltaParts: string[]): string {
     "tool-call blocks separated by whitespace:",
     '<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>',
     "Use only exact tool names from the earlier tool list. Never quote markers, explain",
-    "them, or wrap them in Markdown fences. A \"read\" tool in your own tool list belongs",
-    "to OpenCode, not to Pi, and is disabled in this session - never call it.",
+    "them, or wrap them in Markdown fences. Your own tool list contains only `read`;",
+    "every other name in \"Available Pi tools\" exists only in Pi, so request it with a",
+    "marker instead of calling it.",
     "If you can answer without a tool, answer normally.",
     "",
     "# New transcript since your last response",
