@@ -1511,7 +1511,16 @@ export function createMarkerStreamFilter(): MarkerStreamFilter {
     finish(displayText: string): string {
       if (quoted) return displayText;
       const rest = text.slice(released);
-      return rest.startsWith(MARKER_OPEN) ? UNCLOSED_MARKER_NOTE : rest;
+      if (!rest.startsWith(MARKER_OPEN)) return rest;
+      // `parseToolCallResponse` recovers a complete payload whose closing tag
+      // never arrived, and the turn then uses that call. Reporting the same
+      // bytes as dropped text would be a false alarm on a reply that lost
+      // nothing.
+      const recovered = recoverUnclosedMarkerBody(rest, MARKER_OPEN.length);
+      if (recovered !== undefined && parseToolCallJson(recovered).length > 0) {
+        return "";
+      }
+      return UNCLOSED_MARKER_NOTE;
     },
   };
 }

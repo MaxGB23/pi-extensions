@@ -693,6 +693,23 @@ test("a continued v2 turn prompts the recorded session and creates no new one", 
   );
 });
 
+// Regression from real use on a weak model: `parseToolCallResponse` recovers a
+// complete payload whose closing tag never arrived and the turn then uses that
+// call, so the filter must not report the same bytes as dropped text.
+test("a recovered marker without its closing tag is not reported as dropped text", () => {
+  const filter = createMarkerStreamFilter();
+  const shown = filter.push(
+    'Need this. <pi_tool_call>{"name":"bash","arguments":{"command":"echo hi"}}',
+  );
+
+  assert.equal(shown, "Need this. ", "prose before the marker still streams");
+  assert.equal(
+    filter.finish(""),
+    "",
+    "the payload was recovered and used, so nothing was dropped",
+  );
+});
+
 // S6: the reply used to be cut where an unclosed marker began, and the tail
 // was dropped with no trace. Prose before the marker is already released, so
 // the only honest ending is a visible note saying the rest was not shown.
