@@ -53,6 +53,13 @@ function event(type: string, data: Record<string, unknown> = {}) {
   return { type, data };
 }
 
+function askEvent(sessionID: string, n: number) {
+  return {
+    type: "permission.asked",
+    data: { sessionID, id: "per_" + n, action: "read", resources: [] },
+  };
+}
+
 test("v2 text deltas stream in order and the closing event does not repeat them", () => {
   const state = freshState();
   const { sink, text } = collector();
@@ -403,7 +410,10 @@ function emptyOutput(model: Model<Api>): AssistantMessage {
 }
 
 async function withV2Server(
-  events: (sessionID: string) => Array<{ type: string; data: Record<string, unknown> }>,
+  events: (
+    sessionID: string,
+    promptIndex: number,
+  ) => Array<{ type: string; data: Record<string, unknown> }>,
   run: (
     server: OpenCodeServer,
     seen: Captured[],
@@ -414,6 +424,7 @@ async function withV2Server(
   const seen: Captured[] = [];
   const stats = { closes: 0 };
   const clients = new Set<ServerResponse>();
+  let promptIndex = 0;
   const http = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => {
@@ -453,7 +464,7 @@ async function withV2Server(
       if (prompt) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ data: {} }));
-        for (const event of events(prompt[1]!)) {
+        for (const event of events(prompt[1]!, promptIndex++)) {
           for (const client of clients) {
             client.write("data: " + JSON.stringify(event) + "\n\n");
           }
@@ -681,6 +692,44 @@ test("a continued v2 turn prompts the recorded session and creates no new one", 
   );
 });
 
+// S6: the reply used to be cut where an unclosed marker began, and the tail
+// was dropped with no trace. Prose before the marker is already released, so
+// the only honest ending is a visible note saying the rest was not shown.
+test("an unfinished tool-call block ends the reply with a visible note", () => {
+  const filter = createMarkerStreamFilter();
+
+  assert.equal(filter.push("El texto visible sigue completo."), "El texto visible sigue completo.");
+  filter.push('<pi_tool_call>{"name":"read","argu');
+  const tail = filter.finish("");
+
+  assert.match(tail, /unfinished tool-call block/, "the drop is explained, not silent");
+  assert.ok(
+    !tail.includes("<pi_tool_call>"),
+    "the note never leaks the raw marker",
+  );
+});
+
+// S6: a reply that carries one valid call and one unparseable block keeps the
+// call, but the removed block is reported instead of vanishing.
+test("an unparseable tool-call block is reported instead of silently removed", () => {
+  const allowed = new Set(["read"]);
+  const text = [
+    '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>',
+    '<pi_tool_call>{"name": broken</pi_tool_call>',
+  ].join("\n");
+
+  const parsed = parseToolCallResponse(text, allowed);
+
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.calls, [{ name: "read", arguments: { path: "README.md" } }]);
+  assert.match(
+    parsed.cleanedText ?? "",
+    /could not be parsed/,
+    "the reply says a block was removed instead of ending mid-sentence",
+  );
+});
+
 test("a v2 permission ask is rejected with the marker instruction and the turn survives", async () => {
   const model = bridgeModel();
   const output = emptyOutput(model);
@@ -750,28 +799,45 @@ test("a v2 permission ask is rejected with the marker instruction and the turn s
   assert.deepEqual(text, [["msg_v2b:0", "marker instead"]]);
 });
 
-test("a v2 turn that keeps asking for native tools is stopped at the cap", async () => {
+// S5: the ask cap used to interrupt the turn outright. A model that keeps
+// reaching for OpenCode's disabled native tools now gets a corrective prompt
+// inside the same session, bounded by OPENCODE_PI_TOOL_RESCUES, and only an
+// exhausted budget interrupts.
+test("a v2 turn that exceeds the ask cap is rescued by an in-session correction", async () => {
   const model = bridgeModel();
   const output = emptyOutput(model);
   const { sink } = collector();
 
-  const ask = (sessionID: string, n: number) => ({
-    type: "permission.asked",
-    data: { sessionID, id: "per_" + n, action: "read", resources: [] },
-  });
-
   await withV2Server(
-    (sessionID) => [
-      {
-        type: "session.step.started",
-        data: { sessionID, agent: "pi-model", assistantMessageID: "msg_v2" },
-      },
-      ask(sessionID, 1),
-      ask(sessionID, 2),
-      ask(sessionID, 3),
-      ask(sessionID, 4),
-      { type: "session.execution.succeeded", data: { sessionID } },
-    ],
+    (sessionID, promptIndex) =>
+      promptIndex === 0
+        ? [
+            {
+              type: "session.step.started",
+              data: { sessionID, agent: "pi-model", assistantMessageID: "msg_v2" },
+            },
+            askEvent(sessionID, 1),
+            askEvent(sessionID, 2),
+            askEvent(sessionID, 3),
+            askEvent(sessionID, 4),
+          ]
+        : [
+            {
+              type: "session.step.started",
+              data: { sessionID, agent: "pi-model", assistantMessageID: "msg_rescue" },
+            },
+            {
+              type: "session.text.delta",
+              data: {
+                sessionID,
+                assistantMessageID: "msg_rescue",
+                ordinal: 0,
+                delta:
+                  '{"name":"read","arguments":{"path":"README.md"}}',
+              },
+            },
+            { type: "session.execution.succeeded", data: { sessionID } },
+          ],
     async (server, seen) => {
       const turn = await runV2ServerTurn({
         server,
@@ -784,20 +850,127 @@ test("a v2 turn that keeps asking for native tools is stopped at the cap", async
       });
 
       assert.equal(turn.code, 0);
-      assert.match(turn.state.error ?? "", /4 times/);
-      assert.match(turn.state.error ?? "", /marker/);
+      assert.equal(turn.state.error, undefined, "a rescue keeps the turn alive");
       assert.equal(
-        seen.filter((entry) => entry.path.endsWith("/reply")).length,
+        seen.filter((entry) => entry.path.endsWith("/interrupt")).length,
+        0,
+        "nothing is interrupted while the rescue budget lasts",
+      );
+      const prompts = seen.filter((entry) => /\/prompt$/.test(entry.path));
+      assert.equal(
+        prompts.length,
+        2,
+        "the initial prompt plus one corrective prompt in the same session",
+      );
+      assert.match(
+        JSON.stringify(prompts[1]?.body),
+        /pi_tool_call/,
+        "the corrective prompt restates the marker protocol",
+      );
+      assert.match(turn.state.text, /"name":"read"/, "the correction produced a payload");
+    },
+  );
+});
+
+test("a v2 turn stops asking only after the rescue budget is spent", async () => {
+  const model = bridgeModel();
+  const output = emptyOutput(model);
+  const { sink } = collector();
+
+  const capBatch = (sessionID: string) => [
+    {
+      type: "session.step.started",
+      data: { sessionID, agent: "pi-model", assistantMessageID: "msg_v2" },
+    },
+    askEvent(sessionID, 1),
+    askEvent(sessionID, 2),
+    askEvent(sessionID, 3),
+    askEvent(sessionID, 4),
+  ];
+
+  await withV2Server(
+    (sessionID) => capBatch(sessionID),
+    async (server, seen) => {
+      const turn = await runV2ServerTurn({
+        server,
+        directory: "/tmp/project",
+        prompt: "keep calling native tools",
+        timeoutMs: 5000,
+        model,
+        output,
+        sink,
+      });
+
+      assert.equal(turn.code, 0);
+      assert.equal(
+        seen.filter((entry) => /\/prompt$/.test(entry.path)).length,
         3,
-        "only three asks are answered; the fourth stops the turn",
+        "the initial prompt plus two corrective prompts",
       );
       assert.equal(
         seen.filter((entry) => entry.path.endsWith("/interrupt")).length,
         1,
-        "the stalled execution is interrupted",
+        "an exhausted budget interrupts instead of looping",
+      );
+      assert.match(
+        turn.state.error ?? "",
+        /12 times/,
+        "the diagnostic counts asks across every rescued step",
       );
     },
   );
+});
+
+test("a v2 turn that keeps asking for native tools is stopped at the cap", async () => {
+  const model = bridgeModel();
+  const output = emptyOutput(model);
+  const { sink } = collector();
+
+  const previous = process.env.OPENCODE_PI_TOOL_RESCUES;
+  process.env.OPENCODE_PI_TOOL_RESCUES = "0";
+  try {
+    await withV2Server(
+      (sessionID) => [
+        {
+          type: "session.step.started",
+          data: { sessionID, agent: "pi-model", assistantMessageID: "msg_v2" },
+        },
+        askEvent(sessionID, 1),
+        askEvent(sessionID, 2),
+        askEvent(sessionID, 3),
+        askEvent(sessionID, 4),
+        { type: "session.execution.succeeded", data: { sessionID } },
+      ],
+      async (server, seen) => {
+        const turn = await runV2ServerTurn({
+          server,
+          directory: "/tmp/project",
+          prompt: "keep calling native tools",
+          timeoutMs: 5000,
+          model,
+          output,
+          sink,
+        });
+
+        assert.equal(turn.code, 0);
+        assert.match(turn.state.error ?? "", /4 times/);
+        assert.match(turn.state.error ?? "", /marker/);
+        assert.equal(
+          seen.filter((entry) => entry.path.endsWith("/reply")).length,
+          3,
+          "only three asks are answered; the fourth stops the turn",
+        );
+        assert.equal(
+          seen.filter((entry) => entry.path.endsWith("/interrupt")).length,
+          1,
+          "the stalled execution is interrupted",
+        );
+      },
+    );
+  } finally {
+    if (previous === undefined) delete process.env.OPENCODE_PI_TOOL_RESCUES;
+    else process.env.OPENCODE_PI_TOOL_RESCUES = previous;
+  }
 });
 
 // D1: `called` fires before the permission decision, so only a success or a

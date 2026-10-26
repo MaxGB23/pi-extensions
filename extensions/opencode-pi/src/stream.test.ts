@@ -266,11 +266,13 @@ test("marker filter holds a possible marker start until it is ruled out", () => 
   assert.equal(filter.finish(filter.text), "<");
 });
 
-test("marker filter holds an unclosed marker to the end of the reply", () => {
+test("marker filter replaces an unclosed marker with a visible note at the end of the reply", () => {
   const filter = createMarkerStreamFilter();
   assert.equal(filter.push('Sure. <pi_tool_call>{"name":"read",'), "Sure. ");
   assert.equal(filter.push('"arguments":{}}'), "");
-  assert.equal(filter.finish(filter.text), "");
+  const tail = filter.finish(filter.text);
+  assert.match(tail, /unfinished tool-call block/, "the dropped tail is explained");
+  assert.ok(!tail.includes("<pi_tool_call>"), "no marker byte reaches the chat");
 });
 
 test("marker filter ignores a closing tag inside a JSON string", () => {

@@ -352,17 +352,22 @@ test("parseToolCalls accepts complete marker-only responses", () => {
   ]);
 });
 
-test("parseToolCallResponse keeps valid calls and strips malformed sibling markers", () => {
+test("parseToolCallResponse keeps valid calls and reports malformed sibling markers", () => {
   const response =
     '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>' +
     "<pi_tool_call>{not json}</pi_tool_call>";
 
-  assert.deepEqual(parseToolCallResponse(response, new Set(["read"])), {
-    ok: true,
-    calls: [{ name: "read", arguments: { path: "README.md" } }],
-    cleanedText:
-      '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>',
-  });
+  const parsed = parseToolCallResponse(response, new Set(["read"]));
+
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(parsed.calls, [{ name: "read", arguments: { path: "README.md" } }]);
+  assert.equal(
+    parsed.cleanedText,
+    '<pi_tool_call>{"name":"read","arguments":{"path":"README.md"}}</pi_tool_call>\n\n' +
+      "[opencode-pi] a tool-call block could not be parsed and was removed from this reply.",
+    "the removed block is reported instead of vanishing",
+  );
 });
 
 test("parseToolCallResponse rejects when every marker payload is invalid", () => {
