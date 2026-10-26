@@ -1,6 +1,6 @@
 {
   "name": "opencode-pi",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Bridge OpenCode CLI free models into Pi without OpenCode login",
   "type": "module",
   "main": "./src/index.ts",
@@ -10,7 +10,7 @@
   ],
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node --test dist/index.test.js dist/server.test.js dist/stream.test.js",
+    "test": "npm run build && node --test dist/index.test.js dist/server.test.js dist/stream.test.js dist/v2-stream.test.js",
     "prepublishOnly": "npm run build"
   },
   "pi": {

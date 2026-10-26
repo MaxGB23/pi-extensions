@@ -698,3 +698,87 @@ require("node:http").createServer(() => undefined).listen(0, "127.0.0.1", functi
     },
   );
 });
+
+// PR B, S6: both start-failure shapes must still answer through `opencode run`.
+// A v2 `serve` that prints its banner and then closes `/api/event` before the
+// `server.connected` frame used to answer and then lose the answer: the turn
+// ran the fallback with the streaming finalizer still armed, so the reply was
+// replaced by empty streamed text and the turn failed as an empty response.
+const v2StreamClosingBeforeConnect = `
+const http = require("node:http");
+if (process.argv[2] === "serve") {
+  http.createServer((req, res) => {
+    if (req.url.startsWith("/api/event")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.end();
+      return;
+    }
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  }).listen(0, "127.0.0.1", function () {
+    console.log("opencode server listening on http://127.0.0.1:" + this.address().port);
+  });
+} else {
+  let body = "";
+  process.stdin.on("data", (chunk) => { body += chunk; });
+  process.stdin.on("end", () => {
+    process.stdout.write(JSON.stringify({ type: "text", part: { text: "fallback answer", sessionID: "ses-fallback" } }) + "\\n");
+    process.exit(0);
+  });
+}
+`;
+
+test("a v2 stream that closes before server.connected still answers through opencode run", async () => {
+  const notices: string[] = [];
+  const context = {
+    ...fakeContext(),
+    ui: { notify: (message: string) => notices.push(message) },
+  } as unknown as Context;
+
+  const message = await withFakeOpenCode(
+    v2StreamClosingBeforeConnect,
+    () => streamOpenCode(fakeModel(), context).result(),
+    "opencode v2.1.2",
+  );
+
+  assert.equal(message.stopReason, "stop", message.errorMessage ?? "");
+  assert.deepEqual(
+    message.content
+      .filter((block) => block.type === "text")
+      .map((block) => (block as { text: string }).text),
+    ["fallback answer"],
+    "the fallback's reply is shown, not the empty streamed text",
+  );
+  assert.equal(notices.length, 1, "the fallback is announced once");
+});
+
+// The other shape: the server never prints a banner at all.
+const v2ServerDyingBeforeBanner = `
+if (process.argv[2] === "serve") {
+  process.stderr.write("banner never printed\\n");
+  process.exit(1);
+}
+let body = "";
+process.stdin.on("data", (chunk) => { body += chunk; });
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify({ type: "text", part: { text: "fallback answer" } }) + "\\n");
+  process.exit(0);
+});
+`;
+
+test("a v2 server that dies before its banner answers through opencode run", async () => {
+  const notices: string[] = [];
+  const context = {
+    ...fakeContext(),
+    ui: { notify: (message: string) => notices.push(message) },
+  } as unknown as Context;
+
+  const message = await withFakeOpenCode(
+    v2ServerDyingBeforeBanner,
+    () => streamOpenCode(fakeModel(), context).result(),
+    "opencode v2.1.2",
+  );
+
+  assert.equal(message.stopReason, "stop", message.errorMessage ?? "");
+  assert.equal(notices.length, 1, "the fallback is announced once");
+});
