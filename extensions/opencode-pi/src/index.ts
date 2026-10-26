@@ -1812,6 +1812,35 @@ const V2_PERMISSION_REJECTION_MESSAGE =
 const V2_PERMISSION_ASK_LIMIT = 3;
 
 /**
+ * Corrective prompts sent inside the same OpenCode session before the turn is
+ * interrupted for a native tool the bridge disabled.
+ *
+ * The three rejected asks are soft nudges: v2 records the rejection and starts
+ * a new step by itself, so a model that listens recovers without help. This
+ * budget is the hard nudge for a model that ignores all three, and it exists so
+ * that a format slip never costs the whole turn while it lasts.
+ *
+ * `OPENCODE_PI_TOOL_RESCUES=0` restores the interrupt-at-the-cap behaviour.
+ * Same name and default as the CLI corrective retry, so the two paths cannot
+ * drift apart.
+ */
+function nativeToolRescues(): number {
+  const raw = Number(process.env.OPENCODE_PI_TOOL_RESCUES ?? 2);
+  return Number.isSafeInteger(raw) && raw > 0 ? raw : 0;
+}
+
+/** Correction sent inside the same session after a native tool slipped through. */
+function buildNativeToolCorrection(tool: string): string {
+  const named = tool ? `the native "${tool}" tool` : "a native OpenCode tool";
+  return [
+    `You invoked ${named}, which is disabled in this session: nothing from that call reaches Pi.`,
+    `If Pi must run a tool, reply with only one or more tool-call blocks separated by whitespace:`,
+    `<pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call>`,
+    `Use only exact tool names from the tool list you were given. If you can answer without a tool, answer in plain text.`,
+  ].join("\n");
+}
+
+/**
  * Agent definition for OpenCode v1, which uses the legacy `permission` map
  * and the v1 action names (`bash`, `task`).
  *
@@ -2538,6 +2567,8 @@ export async function runV2ServerTurn(params: {
 
   let finished = false;
   let asks = 0;
+  let totalAsks = 0;
+  let rescues = nativeToolRescues();
   let events: AsyncGenerator<ServerEvent>;
   try {
     // Subscribe first so no event published for the prompt is missed. This
@@ -2584,15 +2615,42 @@ export async function runV2ServerTurn(params: {
           }
           asks += 1;
           if (asks > V2_PERMISSION_ASK_LIMIT) {
-            // A model that keeps asking would loop forever: stop the turn the
-            // same way the v1 path does, with an error naming the count.
-            state.error = `OpenCode asked for native tools ${asks} times; this bridge only accepts marker tool calls, so the turn was interrupted.`;
-            state.stderr = (state.stderr + `\n${state.error}`).slice(-STDERR_LIMIT);
-            await request("POST", `/api/session/${state.sessionId}/interrupt`).catch(
-              () => undefined,
-            );
-            finished = true;
-            break;
+            // Answered asks are soft nudges; past the cap the model gets one
+            // explicit corrective prompt inside the same session, and the turn
+            // is interrupted only when that budget is spent too.
+            totalAsks += asks;
+            const canRescue = rescues > 0 && Boolean(state.sessionId);
+            if (!canRescue) {
+              // A model that keeps asking would loop forever: stop the turn the
+              // same way the v1 path does, with an error naming the count.
+              state.error = `OpenCode asked for native tools ${totalAsks} times; this bridge only accepts marker tool calls, so the turn was interrupted.`;
+              state.stderr = (state.stderr + `\n${state.error}`).slice(-STDERR_LIMIT);
+              await request(
+                "POST",
+                `/api/session/${state.sessionId}/interrupt`,
+              ).catch(() => undefined);
+              finished = true;
+              break;
+            }
+            rescues -= 1;
+            asks = 0;
+            // Reject the ask first so the session has no pending permission
+            // when the correction arrives, then restate the protocol.
+            await request(
+              "POST",
+              `/api/session/${state.sessionId}/permission/${String(data.id)}/reply`,
+              { decision: "reject", message: V2_PERMISSION_REJECTION_MESSAGE },
+            ).catch(() => undefined);
+            await request(
+              "POST",
+              `/api/session/${state.sessionId}/prompt`,
+              v2PromptBody(
+                buildNativeToolCorrection(
+                  typeof data.action === "string" ? data.action : "",
+                ),
+              ),
+            ).catch(() => undefined);
+            continue;
           }
           await request(
             "POST",
