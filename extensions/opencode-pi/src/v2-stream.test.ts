@@ -482,6 +482,7 @@ async function withV2Server(
     await run(
       {
         bin: "fake",
+        prefixArgs: [],
         url: "http://127.0.0.1:" + port,
         authorization: "Basic fake",
         child: {} as ChildProcess,

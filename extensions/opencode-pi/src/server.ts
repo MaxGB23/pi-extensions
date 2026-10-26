@@ -29,6 +29,13 @@ process.on("SIGTERM", stop);
 child.on("exit", (code) => process.exit(code ?? 1));
 child.on("error", (error) => { console.error(String(error)); process.exit(1); });`;
 
+/** A launchable command: an executable plus the arguments that must come first. */
+type LaunchCommand = { command: string; args: string[] };
+
+function normalizeCommand(command: string | LaunchCommand): LaunchCommand {
+  return typeof command === "string" ? { command, args: [] } : command;
+}
+
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "[::1]", "localhost"]);
 
 /**
@@ -68,6 +75,8 @@ export function redactSecret(text: string, secret: string): string {
 
 export type OpenCodeServer = {
   bin: string;
+  /** Arguments the command needs before `serve`, e.g. the script of a Node-based shim. */
+  prefixArgs: string[];
   url: string;
   authorization: string;
   child: ChildProcess;
@@ -97,11 +106,12 @@ let activeUses = 0;
 let idleTimer: ReturnType<typeof setTimeout> | undefined;
 
 export function launch(
-  bin: string,
+  requested: string | LaunchCommand,
   env: NodeJS.ProcessEnv,
   spawnChild: typeof spawn = spawn,
   options: LaunchOptions = {},
 ): Promise<OpenCodeServer> {
+  const command = normalizeCommand(requested);
   const password = randomBytes(24).toString("hex");
   const pure = options.pure ?? true;
   const child = spawnChild(process.execPath, ["-e", WATCHDOG], {
@@ -111,7 +121,7 @@ export function launch(
       // Lets a compiled Bun host run the watchdog script as plain bun.
       BUN_BE_BUN: "1",
       OPENCODE_PI_SERVE_ARGV: JSON.stringify([
-        bin, "serve", ...(pure ? ["--pure"] : []), "--hostname", "127.0.0.1", "--port", "0",
+        command.command, ...command.args, "serve", ...(pure ? ["--pure"] : []), "--hostname", "127.0.0.1", "--port", "0",
       ]),
       OPENCODE_SERVER_USERNAME: "opencode",
       OPENCODE_SERVER_PASSWORD: password,
@@ -152,7 +162,8 @@ export function launch(
       child.removeListener("exit", onExit);
       child.on("exit", () => forget(instance));
       const instance: OpenCodeServer = {
-        bin,
+        bin: command.command,
+        prefixArgs: command.args,
         url,
         authorization: `Basic ${Buffer.from(`opencode:${password}`).toString("base64")}`,
         child,
@@ -181,17 +192,24 @@ function forget(instance: OpenCodeServer): void {
 }
 
 async function ensureServer(
-  bin: string,
+  requested: string | LaunchCommand,
   env: NodeJS.ProcessEnv,
-  options: LaunchOptions,
+  options: LaunchOptions = {},
 ): Promise<OpenCodeServer> {
+  const command = normalizeCommand(requested);
   const pure = options.pure ?? true;
   const current = await server?.catch(() => undefined);
-  if (current && current.bin === bin && current.pure === pure && current.child.exitCode === null) {
+  if (
+    current &&
+    current.bin === command.command &&
+    current.prefixArgs.join("\u0000") === command.args.join("\u0000") &&
+    current.pure === pure &&
+    current.child.exitCode === null
+  ) {
     return current;
   }
   if (current) stopOpenCodeServer();
-  const started = launch(bin, env, spawn, options);
+  const started = launch(command, env, spawn, options);
   server = started;
   try {
     running = await started;
@@ -207,7 +225,7 @@ async function ensureServer(
  * server stops after {@link IDLE_SHUTDOWN_MS} without a turn.
  */
 export async function withOpenCodeServer<T>(
-  bin: string,
+  command: string | LaunchCommand,
   env: NodeJS.ProcessEnv,
   use: (server: OpenCodeServer) => Promise<T>,
   options: LaunchOptions = {},
@@ -216,7 +234,7 @@ export async function withOpenCodeServer<T>(
   if (idleTimer) clearTimeout(idleTimer);
   idleTimer = undefined;
   try {
-    return await use(await ensureServer(bin, env, options));
+    return await use(await ensureServer(command, env, options));
   } finally {
     activeUses -= 1;
     if (activeUses === 0) {

@@ -112,7 +112,7 @@ This queries OpenCode for model metadata (`opencode api GET /api/model` on OpenC
 
 | Environment variable | Description                                                                                         |
 | -------------------- | --------------------------------------------------------------------------------------------------- |
-| `OPENCODE_PI_BIN`    | Path to the OpenCode executable. Defaults to `opencode`, resolved through `PATH` without a shell: on Windows an npm-installed OpenCode leaves only an `opencode.cmd` / `opencode.ps1` shim there, which cannot be spawned, and a custom install outside `PATH` is never found, so point this at the real `opencode.exe`. |
+| `OPENCODE_PI_BIN`    | Override the OpenCode executable path. When unset or empty, the bridge searches `PATH` the way a shell does: on Windows it tries each `PATHEXT` extension and follows a `.cmd` shim to what that shim runs, so a normal npm install works without this variable. Set it when the CLI lives outside `PATH`. A value that points at a `.cmd` or `.bat` shim is expanded the same way, because `spawn()` cannot run a batch file directly; a shim that launches a JavaScript entrypoint is run as `node <entrypoint>`. |
 | `OPENCODE_PI_MODELS` | Comma- or space-separated model list to register. Values without `/` are prefixed with `opencode/`. Registers immediately with conservative fallback metadata (skipping discovery so startup never pays a discovery timeout); run `/opencode-pi update` to enrich these models with real capabilities and cost from discovery. |
 | `OPENCODE_PI_STREAM` | Set to `0` to run turns through `opencode run` instead of streaming them through `opencode serve`. Applies to both CLI dialects. |
 | `OPENCODE_PI_TOOL_RESCUES` | Corrective prompts sent inside the same OpenCode session when a model keeps reaching for OpenCode's disabled native tools, before the turn is interrupted. Defaults to `2`; `0` restores the fail-fast behaviour that interrupted the turn at the first ask past the cap. |
@@ -123,9 +123,9 @@ To find the real executable behind an npm-managed install:
 npm root -g   # then @opencode\cli\bin\opencode.exe under that root
 ```
 
-On Windows, point `OPENCODE_PI_BIN` at that `.exe`: the file of the same name
-in the npm prefix's `bin` directory is only a `.cmd` shim and cannot be
-spawned.
+On Windows, `OPENCODE_PI_BIN` is only needed when the CLI lives outside
+`PATH`: the file of the same name in the npm prefix's `bin` directory is a
+`.cmd` shim, and the bridge follows it to the real executable on its own.
 
 Example:
 
